@@ -14,8 +14,11 @@ use crate::pixelpaint::PixelId;
 use crate::terrain::{HeightSource, Terrain, EARTH_RADIUS_M, MAX_FREQ_CAP};
 use glam::DVec3;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::{Condvar, Mutex, RwLock};
 use std::f64::consts::FRAC_PI_2;
 
 /// Cells along a tile edge (the tile has (N+1)^2 height samples, edges shared with neighbours).
@@ -165,6 +168,97 @@ pub fn generate(terrain: &Terrain, id: PixelId) -> Tile {
     Tile { h }
 }
 
+/// Bump when the tile file layout changes (a changed terrain function or erosion is noticed on its own).
+const DISK_FORMAT: u64 = 1;
+
+/// Tiles kept on disk between runs: the first run makes them, later runs just read them (about 0.05 ms
+/// instead of 5 ms each). Files are written by a background thread, so making a tile never waits for the disk.
+struct DiskCache {
+    dir: PathBuf,
+    tx: Mutex<Option<mpsc::Sender<(PathBuf, Vec<u8>)>>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl DiskCache {
+    fn open(dir: PathBuf) -> DiskCache {
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, rx) = mpsc::channel::<(PathBuf, Vec<u8>)>();
+        let writer = std::thread::Builder::new()
+            .name("tile-writer".into())
+            .spawn(move || {
+                for (path, bytes) in rx {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // Written under another name and renamed, so a file is either whole or not there.
+                    let tmp = path.with_extension("tmp");
+                    if std::fs::write(&tmp, &bytes).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                }
+            })
+            .expect("tile writer thread");
+        DiskCache { dir, tx: Mutex::new(Some(tx)), writer: Mutex::new(Some(writer)) }
+    }
+
+    fn path(&self, id: PixelId) -> PathBuf {
+        self.dir.join(format!("L{}", id.level)).join(format!("{}_{}_{}.bin", id.face, id.x, id.y))
+    }
+
+    fn has(&self, id: PixelId) -> bool {
+        self.path(id).exists()
+    }
+
+    fn load(&self, id: PixelId) -> Option<Tile> {
+        let bytes = std::fs::read(self.path(id)).ok()?;
+        if bytes.len() != SAMPLES * SAMPLES * 4 {
+            return None;
+        }
+        Some(Tile { h: bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() })
+    }
+
+    fn store(&self, id: PixelId, tile: &Tile) {
+        let bytes: Vec<u8> = tile.h.iter().flat_map(|v| v.to_le_bytes()).collect();
+        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+            let _ = tx.send((self.path(id), bytes));
+        }
+    }
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        self.tx.lock().unwrap().take(); // closes the queue; the writer finishes what is left and ends
+        if let Some(w) = self.writer.lock().unwrap().take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// Identifies what the tiles look like: the terrain function, the erosion and the layout. Tiles on disk made
+/// by anything else are simply not used (they sit in another folder).
+fn fingerprint(t: &Terrain) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    for k in 0..12 {
+        let d = DVec3::new((k as f64 * 1.3).sin(), (k as f64 * 0.7).cos(), (k as f64 * 2.1).sin() + 0.1).normalize();
+        for f in [1.0, 40.0, 3000.0] {
+            mix(t.height_fn(d, f).to_bits());
+        }
+    }
+    let m = 24;
+    let mut g: Vec<f64> = (0..m * m).map(|i| ((i * 7919) % 101) as f64 * 3.0).collect();
+    erode(&mut g, m, 30.0, ERODE_ITERS);
+    for x in g {
+        mix(x.to_bits());
+    }
+    mix(TILE_N as u64);
+    mix(DISK_FORMAT);
+    h
+}
+
 struct Cached {
     tile: Tile,
     used: AtomicU64,
@@ -178,6 +272,11 @@ pub struct TileStore {
     tick: AtomicU64,
     generated: AtomicUsize,
     capacity: usize,
+    /// Tiles being made right now: a second thread that needs one waits for it instead of making it again.
+    making: Mutex<HashSet<PixelId>>,
+    made: Condvar,
+    disk: Option<DiskCache>,
+    from_disk: AtomicUsize,
 }
 
 impl TileStore {
@@ -192,7 +291,55 @@ impl TileStore {
             tick: AtomicU64::new(0),
             generated: AtomicUsize::new(0),
             capacity: capacity.max(8),
+            making: Mutex::new(HashSet::new()),
+            made: Condvar::new(),
+            disk: None,
+            from_disk: AtomicUsize::new(0),
         }
+    }
+
+    /// A store that keeps its tiles in `root` between runs (in a folder named after what the terrain looks like).
+    pub fn with_disk(terrain: Terrain, root: &Path) -> TileStore {
+        let dir = root.join(format!("{:016x}", fingerprint(&terrain)));
+        let mut s = TileStore::with_capacity(terrain, CACHE_TILES);
+        s.disk = Some(DiskCache::open(dir));
+        s
+    }
+
+    /// Tiles read from disk instead of generated.
+    pub fn from_disk(&self) -> usize {
+        self.from_disk.load(Ordering::Relaxed)
+    }
+
+    /// Makes sure every tile up to `max_level` is on disk (coarse levels first), with `threads` workers. Tiles
+    /// already there are skipped. Does nothing without a disk cache.
+    pub fn pregenerate(&self, max_level: u8, threads: usize) {
+        let Some(disk) = self.disk.as_ref() else { return };
+        let mut ids = Vec::new();
+        for level in 0..=max_level {
+            let n = 1u32 << level;
+            for face in 0..6u8 {
+                for y in 0..n {
+                    for x in 0..n {
+                        ids.push(PixelId::new(face, level, x, y));
+                    }
+                }
+            }
+        }
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..threads.max(1) {
+                sc.spawn(|| loop {
+                    let q = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(id) = ids.get(q) else { break };
+                    if !disk.has(*id) {
+                        let t = generate(&self.terrain, *id);
+                        self.generated.fetch_add(1, Ordering::Relaxed);
+                        disk.store(*id, &t);
+                    }
+                });
+            }
+        });
     }
 
     pub fn terrain(&self) -> &Terrain {
@@ -226,10 +373,40 @@ impl TileStore {
         if let Some(r) = self.with_cached(id, |t| (f.take().unwrap())(t)) {
             return r;
         }
-        let tile = generate(&self.terrain, id);
-        self.generated.fetch_add(1, Ordering::Relaxed);
+        // One thread makes a tile; others needing it meanwhile wait and then read it.
+        loop {
+            let mut making = self.making.lock().unwrap();
+            if making.contains(&id) {
+                while making.contains(&id) {
+                    making = self.made.wait(making).unwrap();
+                }
+                drop(making);
+                if let Some(r) = self.with_cached(id, |t| (f.take().unwrap())(t)) {
+                    return r;
+                }
+                continue; // evicted again already: try to make it ourselves
+            }
+            making.insert(id);
+            break;
+        }
+        let tile = match self.disk.as_ref().and_then(|d| d.load(id)) {
+            Some(t) => {
+                self.from_disk.fetch_add(1, Ordering::Relaxed);
+                t
+            }
+            None => {
+                let t = generate(&self.terrain, id);
+                self.generated.fetch_add(1, Ordering::Relaxed);
+                if let Some(d) = &self.disk {
+                    d.store(id, &t);
+                }
+                t
+            }
+        };
         let r = (f.take().unwrap())(&tile);
         self.insert(id, tile);
+        self.making.lock().unwrap().remove(&id);
+        self.made.notify_all();
         r
     }
 
@@ -528,5 +705,40 @@ mod tests {
                 assert!((t.cubic(fx, fy) - t.bilinear(fx, fy)).abs() < 600.0);
             }
         });
+    }
+
+    #[test]
+    fn tiles_saved_to_disk_are_read_back_instead_of_generated() {
+        let dir = std::env::temp_dir().join(format!("gmm-tiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = PixelId::new(1, 6, 9, 20);
+        let d = dir_for(&id);
+        let first = {
+            let s = TileStore::with_disk(Terrain::new(7), &dir);
+            let v = s.sample(d, 6);
+            assert_eq!(s.generated(), 1);
+            v
+        }; // dropping the store waits for the writer, so the file is there
+        let s = TileStore::with_disk(Terrain::new(7), &dir);
+        let again = s.sample(d, 6);
+        assert_eq!((s.generated(), s.from_disk()), (0, 1), "second run should read the tile, not make it");
+        assert_eq!(first, again);
+        // Another terrain does not pick these tiles up.
+        let other = TileStore::with_disk(Terrain::new(8), &dir);
+        other.sample(d, 6);
+        assert_eq!(other.from_disk(), 0);
+        drop((s, other));
+        // Pregeneration fills in the coarse levels, and only what is missing.
+        let p = TileStore::with_disk(Terrain::new(7), &dir);
+        p.pregenerate(1, 2);
+        assert_eq!(p.generated(), 6 + 24);
+        p.pregenerate(1, 2);
+        assert_eq!(p.generated(), 6 + 24);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dir_for(id: &PixelId) -> DVec3 {
+        id.center_dir()
     }
 }

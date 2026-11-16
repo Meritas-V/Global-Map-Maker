@@ -51,6 +51,7 @@ impl Fly {
     }
 }
 
+#[derive(Clone)]
 pub struct Camera {
     pub yaw: f64,
     pub pitch: f64,

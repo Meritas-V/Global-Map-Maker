@@ -5,7 +5,7 @@
 
 struct Uniforms {
     mvp: mat4x4<f32>,     // (globe position - origin) -> screen
-    sun: vec4<f32>,       // xyz: toward the light, globe coordinates
+    sun: vec4<f32>,       // xyz: toward the light, globe coordinates; w: focal length in pixels
     eye: vec4<f32>,       // xyz: camera position relative to origin; w: distance to the horizon (haze scale)
     origin: vec4<f32>,    // xyz: the origin point, globe coordinates
     sky: vec4<f32>,       // rgb: sky color; w: haze amount (0 = no haze)
@@ -17,7 +17,9 @@ struct VertexIn {
     @location(0) pos: vec3<f32>,   // relative to the patch center
     @location(1) nrm: vec4<f32>,   // xyz: shading normal; w: steepness * 1.6
     @location(2) hr: vec2<f32>,    // x: height (m, negative = sea floor); y: range height (m)
-    @location(3) inst: vec4<f32>,  // per patch: its center relative to the origin
+    @location(3) inst: vec4<f32>,  // per patch: xyz its center relative to the origin; w its width (radians)
+    @location(4) morph: f32,       // radial move onto the parent patch's half-resolution mesh
+    @location(5) nrm_p: vec4<f32>, // the normal that mesh has there
 };
 
 struct VertexOut {
@@ -31,9 +33,20 @@ struct VertexOut {
 @vertex
 fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let p = v.pos + v.inst.xyz;
+    var p = v.pos + v.inst.xyz;
+    // Geomorphing: a patch is split when it grows past the limit `lim` below, so its children start at about
+    // half of it (0.5). The slide happens only between 0.54 and 0.66 of it (the far end of the patch's
+    // range, like CDLOD's last 30%): a patch is its sharp self for the rest of its life. Between those two the points slide from the parent's coarser shape to their own, so a level change
+    // never pops (the same blend in reverse when moving away).
+    let dist = max(distance(u.eye.xyz, p), 1e-9);
+    let px = u.sun.w * v.inst.w / dist;
+    // The split limit grows with distance (ground::px_limit); children are born at half of it.
+    let gain = select(0.0, 1.0, u.sky.w > 0.5); // inside only (sky.w = haze flag)
+    let lim = select(56.0, 112.0, u.sky.w > 0.5) * (1.0 + clamp((dist - 10000.0 / 6371000.0) / (10000.0 / 6371000.0), 0.0, gain));
+    let k = 1.0 - smooth_(0.54 * lim, 0.66 * lim, px);
+    p = p + normalize(u.origin.xyz + p) * (v.morph * k);
     out.clip = u.mvp * vec4<f32>(p, 1.0);
-    out.nrm = v.nrm.xyz;
+    out.nrm = normalize(mix(v.nrm.xyz, v.nrm_p.xyz, k));
     out.steep = v.nrm.w / 1.6;
     out.hr = v.hr;
     out.rel = p;
@@ -73,16 +86,18 @@ fn land(h: f32) -> vec3<f32> {
     let c2 = vec3<f32>(0.22, 0.42, 0.08);
     let c3 = vec3<f32>(0.15, 0.34, 0.06);
     let c4 = vec3<f32>(0.07, 0.22, 0.06);
-    let c5 = vec3<f32>(0.30, 0.25, 0.17);
-    let c6 = vec3<f32>(0.42, 0.38, 0.32);
+    let c5 = vec3<f32>(0.18, 0.27, 0.09);
+    let c6 = vec3<f32>(0.33, 0.30, 0.25);
+    let c7 = vec3<f32>(0.42, 0.38, 0.33);
     if h <= 0.0 { return c0; }
     if h <= 6.0 { return seg(c0, c1, 0.0, 6.0, h); }
     if h <= 40.0 { return seg(c1, c2, 6.0, 40.0, h); }
     if h <= 500.0 { return seg(c2, c3, 40.0, 500.0, h); }
     if h <= 1200.0 { return seg(c3, c4, 500.0, 1200.0, h); }
     if h <= 2000.0 { return seg(c4, c5, 1200.0, 2000.0, h); }
-    if h <= 3000.0 { return seg(c5, c6, 2000.0, 3000.0, h); }
-    return c6;
+    if h <= 2600.0 { return seg(c5, c6, 2000.0, 2600.0, h); }
+    if h <= 3200.0 { return seg(c6, c7, 2600.0, 3200.0, h); }
+    return c7;
 }
 
 // ---- ground detail: noise anchored to the world (in meters), so it does not swim when the camera moves ----
@@ -194,7 +209,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     color = mix(color, vec3<f32>(0.92, 0.96, 1.0) * (0.35 + 0.65 * max(dot(up, u.sun.xyz), 0.0)), foam * 0.85);
     if u.sky.w > 0.0 {
         let t = clamp(length(rel - u.eye.xyz) / u.eye.w, 0.0, 1.0);
-        let f = 0.8 * u.sky.w * (t * t * (3.0 - 2.0 * t));
+        let f = 1.0 * u.sky.w * (t * t * (3.0 - 2.0 * t));
         color = mix(color, u.sky.rgb, f);
     }
     return vec4<f32>(color, 1.0);

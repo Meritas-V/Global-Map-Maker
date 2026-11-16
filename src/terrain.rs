@@ -31,7 +31,17 @@ const MACRO_PEAK_M: f64 = 4_800.0;
 /// The signal (measured from its average) spreads about 0.12, so CRAG_AMP is roughly meters per 0.12.
 const CRAG_AMP: f64 = 9_000.0;
 const CRAG_PERSISTENCE: f64 = 0.64;
+/// Crag octaves from this one on (about 5 km features and finer) fade faster, so the fine grain stays calm.
+const CRAG_KNEE: u32 = 5;
+const CRAG_FINE_PERSISTENCE: f64 = 0.5;
+/// Rounding of the ridge creases in the fine crag octaves (noise units).
+const FINE_CREASE: f64 = 0.05;
 const HILLS_M: f64 = 600.0;
+/// Rolling relief of the plains (meters) and how fast it fades toward fine detail: smooth, soft ground.
+const PLAIN_HILLS_M: f64 = 45.0;
+const HILLS_PERSISTENCE: f64 = 0.5;
+/// Soft rolling hills on the plains: amplitude in meters (a few km wide, fading to nothing at fine scales).
+const PLAIN_ROLL_M: f64 = 450.0;
 /// Ridge noise below this is plain, above it (over the span) it rises to peaks.
 const RIDGE_LOW: f64 = 0.30;
 const RIDGE_SPAN: f64 = 0.45;
@@ -89,6 +99,11 @@ pub trait HeightSource: Sync {
     /// lazily can build everything missing at once, in parallel. Does nothing by default.
     fn prefetch(&self, _points: &[(DVec3, f64)]) {}
 
+    /// `ground_radius` that never makes data (see `height_m_peek`): for things that run on the main thread every frame.
+    fn ground_radius_peek(&self, d: DVec3, max_freq: f64) -> f64 {
+        1.0 + self.height_m_peek(d, max_freq).max(0.0) / EARTH_RADIUS_M
+    }
+
     /// First point where a ray from `origin` along `dir` meets the surface (one detail limit everywhere).
     fn pick_ray(&self, origin: DVec3, dir: DVec3, max_freq: f64) -> Option<DVec3> {
         march(origin, dir, &|u| self.ground_radius(u, max_freq))
@@ -145,24 +160,27 @@ pub struct TerrainRef<'a> {
     /// The finest detail limit (what the ground right under the camera gets).
     pub max_freq: f64,
     lod: Option<(DVec3, f64, f64)>, // eye, lens focal_px, radius of the ground under the camera
+    /// Set by `capped`: the finest detail the scene allows (ground meshes never use finer height tiles).
+    pub detail_cap: Option<f64>,
 }
 
 impl<'a> TerrainRef<'a> {
     /// Detail follows distance from this camera; `height_px` is the window height.
     pub fn new(terrain: &'a dyn HeightSource, camera: &Camera, height_px: f64) -> TerrainRef<'a> {
         let focal = Camera::focal_px(height_px);
-        TerrainRef { terrain, max_freq: max_freq(camera.height(), focal), lod: Some((camera.eye64(), focal, camera.floor)) }
+        TerrainRef { terrain, max_freq: max_freq(camera.height(), focal), lod: Some((camera.eye64(), focal, camera.floor)), detail_cap: None }
     }
 
     /// The same, but never finer than `cap` (the outside map view stays soft however close you get).
     pub fn capped(mut self, cap: f64) -> TerrainRef<'a> {
         self.max_freq = self.max_freq.min(cap).max(1.0);
+        self.detail_cap = Some(cap);
         self
     }
 
     /// One detail limit everywhere.
     pub fn fixed(terrain: &'a dyn HeightSource, max_freq: f64) -> TerrainRef<'a> {
-        TerrainRef { terrain, max_freq, lod: None }
+        TerrainRef { terrain, max_freq, lod: None, detail_cap: None }
     }
 
     /// Detail limit for the ground in direction `d`.
@@ -199,6 +217,11 @@ impl<'a> TerrainRef<'a> {
     /// First point where a ray meets the surface.
     pub fn pick(&self, origin: DVec3, dir: DVec3) -> Option<DVec3> {
         march(origin, dir, &|u| self.radius(u))
+    }
+
+    /// The same without making any tile (coarser data stands in where finer is not there yet): for the cursor.
+    pub fn pick_peek(&self, origin: DVec3, dir: DVec3) -> Option<DVec3> {
+        march(origin, dir, &|u| self.radius_peek(u))
     }
 }
 
@@ -268,6 +291,12 @@ impl Terrain {
 
     /// Fractal noise: each octave doubles the frequency and scales the strength by `persistence`.
     fn fbm(&self, d: DVec3, f0: f64, persistence: f64, octaves: u32, max_freq: f64, ridged: bool) -> f64 {
+        self.fbm_ex(d, f0, persistence, octaves, max_freq, ridged, u32::MAX, persistence)
+    }
+
+    /// Like `fbm`, but from octave `knee` on the strength falls by `fine_persistence` per octave instead:
+    /// keeps the big shapes as they are and calms the fine grain (and, for ridged noise, rounds the ridge creases).
+    fn fbm_ex(&self, d: DVec3, f0: f64, persistence: f64, octaves: u32, max_freq: f64, ridged: bool, knee: u32, fine_persistence: f64) -> f64 {
         let (mut sum, mut amp, mut norm, mut f) = (0.0, 1.0, 0.0, f0);
         for o in 0..octaves {
             norm += amp;
@@ -278,10 +307,16 @@ impl Terrain {
                 let n = self.noise(d.x * f + off, d.y * f - off, d.z * f + 0.5 * off);
                 // Ridged octaves are measured from their average, so leaving octaves out (low detail) leaves the average
                 // behind instead of a big hole: zooming out must not sink the mountains.
-                let v = if ridged { (1.0 - n.abs()).powi(2) - RIDGE_MEAN } else { n };
+                let v = if ridged {
+                    // Fine octaves get a rounded crease (|n| smoothed near 0): sharp peaks stay, needle noise goes.
+                    let a = if o >= knee { (n * n + FINE_CREASE * FINE_CREASE).sqrt() - FINE_CREASE } else { n.abs() };
+                    (1.0 - a).powi(2) - RIDGE_MEAN
+                } else {
+                    n
+                };
                 sum += v * amp * w;
             }
-            amp *= persistence;
+            amp *= if o + 1 >= knee { fine_persistence } else { persistence };
             f *= 2.0;
         }
         sum / norm
@@ -303,17 +338,39 @@ impl Terrain {
             return h.max(-MAX_DEPTH_M);
         }
         let r = smooth(0.0, 0.10, e);
-        let low = 1100.0 * smooth(0.0, 0.4, e);
+        // Continental base: land rises gently from the coast, with broad swells and plateaus further in. Plains stay
+        // low (a few hundred meters) instead of every bit of inland being highland.
+        let swell = smooth(0.1, 0.5, self.fbm(d, 3.1, 0.5, 3, max_freq, false));
+        let low = 380.0 * smooth(0.0, 0.5, e) + 700.0 * swell * smooth(0.05, 0.4, e);
         let belt = smooth(0.02, 0.34, self.fbm(d, 2.6, 0.5, 4, max_freq, false) + 0.07);
+        // Bend the direction a little before the mountain noises read it: ridges curve and wander instead of
+        // looking like one uniform grain over the whole planet.
+        let wf = Self::octave_weight(9.0, max_freq) * 0.035;
+        let dw = if wf > 0.0 {
+            let w = |o: f64| self.noise(d.x * 9.0 + o, d.y * 9.0 - o, d.z * 9.0 + 0.5 * o);
+            (d + DVec3::new(w(5.1), w(31.4), w(71.7)) * wf).normalize()
+        } else {
+            d
+        };
         // Macro shape: the mountain belts themselves (ridge noise at frequencies 7..56).
-        let ridge = RIDGE_MEAN + self.fbm(d, 7.0, 0.62, MACRO_RIDGE_OCTAVES, max_freq, true);
+        let ridge = RIDGE_MEAN + self.fbm(dw, 7.0, 0.62, MACRO_RIDGE_OCTAVES, max_freq, true);
         let peaks = ((ridge - RIDGE_LOW) / RIDGE_SPAN).clamp(0.0, 1.0).powf(2.0);
-        let macro_h = low + belt * smooth(0.02, 0.22, e) * MACRO_PEAK_M * peaks;
-        // Detail: only on rugged high ground, so plains and valleys stay smooth and ridges stay sharp.
-        let rugged = smooth(250.0, 2_500.0, macro_h);
-        let crags = self.fbm(d, 7.0 * 16.0, CRAG_PERSISTENCE, 18, max_freq, true) * CRAG_AMP * rugged;
-        let hills = self.fbm(d, 30.0, 0.58, 18, max_freq, false) * HILLS_M * (0.3 + 0.7 * rugged);
-        soft_peak(macro_h + (hills + crags) * r)
+        let mountain = belt * smooth(0.02, 0.22, e) * peaks; // 0 on plains .. 1 on the highest belts
+        let macro_h = low + MACRO_PEAK_M * mountain;
+        // Detail follows the terrain TYPE, not the height: crags (sharp ridged detail) only inside the mountain
+        // belts, hills mostly there too, and the plains between stay smooth with only gentle rolling.
+        let rugged = smooth(0.04, 0.45, mountain);
+        let crags = self.fbm_ex(dw, 7.0 * 16.0, CRAG_PERSISTENCE, 18, max_freq, true, CRAG_KNEE, CRAG_FINE_PERSISTENCE) * CRAG_AMP * rugged;
+        let hills = self.fbm(dw, 30.0, HILLS_PERSISTENCE, 18, max_freq, false) * (PLAIN_HILLS_M + (HILLS_M - PLAIN_HILLS_M) * smooth(0.04, 0.6, mountain));
+        // Rolling country: soft hills a few km across, strongest on the plains (mountains have their own relief).
+        let rolling = self.fbm(dw, 500.0, 0.5, 14, max_freq, false) * PLAIN_ROLL_M * (1.0 - 0.8 * smooth(0.04, 0.5, mountain));
+        // Near the coast the relief may only add, never dig: otherwise flat land just above sea level gets
+        // dips below zero and turns into scattered ponds with sand rims. The dig allowed grows with the land's rise.
+        let relief = hills + rolling + crags;
+        let relief = if relief < 0.0 { relief * smooth(0.04, 0.4, e) } else { relief };
+        // Gentle shore: land right at the coast sits a little above the water and rises smoothly.
+        let shore = 1.5 + 10.0 * smooth(0.0, 0.08, e);
+        soft_peak((macro_h + relief * r).max(shore))
     }
 }
 
@@ -361,12 +418,13 @@ pub fn color(h: f64, steepness: f64) -> [f32; 3] {
     let base = ramp(
         &[
             (0.0, [0.62, 0.50, 0.26]),
-            (6.0, [0.58, 0.47, 0.24]),
-            (40.0, [0.22, 0.42, 0.08]),
+            (7.0, [0.58, 0.47, 0.24]),
+            (13.0, [0.22, 0.42, 0.08]),
             (500.0, [0.15, 0.34, 0.06]),
             (1_200.0, [0.07, 0.22, 0.06]),
-            (2_000.0, [0.30, 0.25, 0.17]),
-            (3_000.0, [0.42, 0.38, 0.32]),
+            (2_000.0, [0.18, 0.27, 0.09]),
+            (2_600.0, [0.33, 0.30, 0.25]),
+            (3_200.0, [0.42, 0.38, 0.33]),
         ],
         h,
     );

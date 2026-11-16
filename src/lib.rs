@@ -8,6 +8,7 @@ pub mod mesh;
 pub mod overlay;
 pub mod pixelpaint;
 pub mod pixelview;
+pub mod stream;
 pub mod terrain;
 pub mod tiles;
 pub mod tools;

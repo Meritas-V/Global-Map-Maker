@@ -14,12 +14,14 @@ use global_map_maker::overlay::{build_overlay, meters_per_pixel, OverlayVertex};
 use h3o::{CellIndex, Resolution};
 use glam::DVec3;
 use std::collections::HashSet;
-use global_map_maker::ground::{build_patches, crowd, patch_key, visible_patches, GroundVertex, Lighting, PatchKey, MAX_PATCHES, SKY};
+use global_map_maker::ground::{build_patches, patch_key, visible_patches, GroundVertex, Lighting, PatchKey, PatchMesh, MAX_PATCHES, SKY};
+use global_map_maker::pixelpaint::PixelId as PatchId;
+use global_map_maker::stream::{plan_frame, Streamer, BASE_LEVEL};
+use std::sync::Arc;
 use std::collections::HashMap;
 use global_map_maker::terrain::{Terrain, TerrainRef};
 use global_map_maker::tiles::TileStore;
 use global_map_maker::mesh::Vertex;
-use std::sync::Arc;
 use std::time::Instant;
 use winit::{
     application::ApplicationHandler,
@@ -33,7 +35,35 @@ use winit::{
 /// Room for the ground / hex triangles (hexes: 18 vertices each).
 const MAX_VERTS: usize = 600_000;
 /// Ground patch meshes kept between frames.
-const PATCH_CACHE_MAX: usize = 9_000;
+const PATCH_CACHE_MAX: usize = 24_000;
+/// Height tiles up to this level are made ahead in the background (about 140 MB on disk, once).
+const PREGEN_LEVEL: u8 = 5;
+/// Numbers behind the loading readout in the window title.
+struct LoadStats {
+    t: Instant,
+    gen0: usize,
+    disk0: usize,
+    meshes: usize,
+    /// Meshes made again that had been thrown out of the cache earlier (should stay near 0).
+    reloads: usize,
+    missing: usize,
+    drawn: usize,
+    rebuild_ms: f64,
+    line: String,
+}
+
+impl LoadStats {
+    fn new() -> LoadStats {
+        LoadStats { t: Instant::now(), gen0: 0, disk0: 0, meshes: 0, reloads: 0, missing: 0, drawn: 0, rebuild_ms: 0.0, line: String::new() }
+    }
+}
+
+/// Finished patches picked up from the loader per frame.
+const UPLOADS_PER_FRAME: usize = 200;
+/// Most time one frame spends putting finished meshes on the GPU.
+const UPLOAD_BUDGET_S: f64 = 0.004;
+/// How far ahead (seconds of flying) the loader looks.
+const AHEAD_SECONDS: f64 = 1.5;
 /// Room for the pixel layer's triangles.
 const PIXEL_MAX_VERTS: usize = 900_000;
 /// Brush radius in pixels for the pixel layer ( - and = change it).
@@ -60,7 +90,10 @@ const INSIDE_ENTER_TILT: f64 = -0.8;
 /// Fly speed: this many heights above the ground per second (shift = faster).
 /// One cached ground patch mesh on the GPU.
 struct GpuPatch {
+    /// Vertices first, then (from `index_at`) the u16 indices.
     buf: wgpu::Buffer,
+    index_at: u64,
+    /// Number of indices to draw.
     count: u32,
     center: DVec3,
     used: u64,
@@ -70,6 +103,10 @@ struct GpuPatch {
 const GLIDE_TAU: f64 = 0.45;
 /// Inside, the camera never gets closer to the real ground than this fraction of its height.
 const CLEARANCE: f64 = 0.25;
+/// Render distance inside: default and limits (km).
+const RENDER_KM_DEFAULT: f64 = 80.0;
+const RENDER_KM_MIN: f64 = 1.5;
+const RENDER_KM_MAX: f64 = 1500.0;
 const FLY_SPEED: f64 = 0.8;
 const FLY_BOOST: f64 = 5.0;
 
@@ -93,7 +130,18 @@ struct Gpu {
     pixel_buf: wgpu::Buffer,
     pixel_count: u32,
     /// The planet's terrain (flat-sphere ground only) and the detail limit for the current frame.
-    terrain: TileStore,
+    terrain: Arc<TileStore>,
+    /// Background loader for ground patches (see stream.rs).
+    streamer: Streamer,
+    /// Newest ready mesh of each patch, and what was drawn last frame (stand-ins while the real ones load).
+    by_id: HashMap<PatchId, PatchKey>,
+    ahead_wanted: Vec<(f64, PatchKey)>,
+    frame_no: u64,
+    last_title: String,
+    /// The camera numbers the last ground plan was made for.
+    last_sig: Option<[f64; 12]>,
+    /// Loading readout for the window title (refreshed about once a second) and what it is made from.
+    stats: LoadStats,
     max_freq: f64,
     overlay_buf: wgpu::Buffer,
     overlay_count: u32,
@@ -103,8 +151,10 @@ struct Gpu {
     /// Per-patch offsets (one vec4 each), written every frame; patch meshes themselves are kept between frames.
     inst_buf: wgpu::Buffer,
     patch_cache: HashMap<PatchKey, GpuPatch>,
+    /// Keys thrown out of the cache recently, to notice when one has to be made again.
+    evicted: HashSet<PatchKey>,
     patch_tick: u64,
-    draw_list: Vec<(wgpu::Buffer, u32)>,
+    draw_list: Vec<(wgpu::Buffer, u64, u32)>,
     ground_light: Lighting,
     ground_uniform: wgpu::Buffer,
     ground_bind: wgpu::BindGroup,
@@ -112,11 +162,11 @@ struct Gpu {
     dirty: bool,
     /// Only the pixel layer / highlight changed (painting, hover): the ground mesh is kept.
     pixels_dirty: bool,
-    /// Extra rebuilds left to settle after new height tiles appeared mid-frame.
-    settle: u8,
     hex_count: usize,
     /// Inside: height above the (smoothed) ground the user asked for, in globe radii.
     fly_alt: f64,
+    /// Inside: render distance in km (PageUp / PageDown).
+    render_km: f64,
     /// Inside: ground level the camera glides on (a smoothed version of the land under it).
     floor_smooth: f64,
     last_glide: Instant,
@@ -214,6 +264,15 @@ impl Gpu {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface not supported by this GPU");
         surface.configure(&device, &config);
+
+        // Tiles are kept on disk between runs (cache/tiles, ignored by git); the coarse levels are made in the
+        // background once, so the next start finds them ready.
+        let terrain = Arc::new(TileStore::with_disk(Terrain::new(2026), std::path::Path::new("cache/tiles")));
+        {
+            let t = terrain.clone();
+            let workers = (std::thread::available_parallelism().map_or(2, |n| n.get()) / 4).max(1);
+            std::thread::Builder::new().name("tile-pregen".into()).spawn(move || t.pregenerate(PREGEN_LEVEL, workers)).ok();
+        }
 
         // Room for the most cells we'll ever draw. Refilled whenever the camera moves.
         let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -323,7 +382,7 @@ impl Gpu {
                     Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<GroundVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Float32x2],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Float32x2, 4 => Float32, 5 => Snorm8x4],
                     }),
                     Some(wgpu::VertexBufferLayout {
                         array_stride: 16,
@@ -460,7 +519,14 @@ impl Gpu {
             overlay_pipeline,
             pixel_pipeline,
             pixel_pipeline_depth,
-            terrain: TileStore::new(Terrain::new(2026)),
+            terrain: terrain.clone(),
+            streamer: Streamer::new(terrain, std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1)).clamp(1, 8)),
+            by_id: HashMap::new(),
+            ahead_wanted: Vec::new(),
+            frame_no: 0,
+            last_title: String::new(),
+            last_sig: None,
+            stats: LoadStats::new(),
             max_freq: 1.0,
             pixel_buf,
             pixel_count: 0,
@@ -471,6 +537,7 @@ impl Gpu {
             ground_pipeline,
             inst_buf,
             patch_cache: HashMap::new(),
+            evicted: HashSet::new(),
             patch_tick: 0,
             draw_list: Vec::new(),
             ground_light: Lighting::new(DVec3::Z, DVec3::X, DVec3::X * 2.0, None),
@@ -478,9 +545,9 @@ impl Gpu {
             ground_bind,
             dirty: true,
             pixels_dirty: false,
-            settle: 0,
             hex_count: 0,
             fly_alt: INSIDE_ENTER_ALT,
+            render_km: RENDER_KM_DEFAULT,
             floor_smooth: 1.0,
             last_glide: Instant::now(),
             uniform_buf,
@@ -521,15 +588,20 @@ impl Gpu {
 
     /// How the terrain is read for the current scene: inside gets all the detail the screen can show,
     /// outside is capped so the globe stays a clean map.
+    /// Render distance in globe radii (infinite outside, where the whole globe is the view).
+    fn render_dist(&self) -> f64 {
+        if self.inside() && !self.hex { self.render_km * 1000.0 / global_map_maker::terrain::EARTH_RADIUS_M } else { f64::INFINITY }
+    }
+
     fn terrain_ref(&self) -> TerrainRef<'_> {
-        let t = TerrainRef::new(&self.terrain, &self.camera, self.config.height as f64);
+        let t = TerrainRef::new(&*self.terrain, &self.camera, self.config.height as f64);
         if self.inside() { t } else { t.capped(OUTSIDE_CAP) }
     }
 
     /// (detail limit, ground radius) under the camera for the current scene.
     fn ground_under_camera(&self) -> (f64, f64) {
         let f = self.terrain_ref().max_freq;
-        (f, global_map_maker::terrain::HeightSource::ground_radius(&self.terrain, self.camera.eye64().normalize(), f))
+        (f, global_map_maker::terrain::HeightSource::ground_radius_peek(&*self.terrain, self.camera.eye64().normalize(), f))
     }
 
     /// Ground level for the flying camera: the land averaged over a disk about as wide as the camera is high
@@ -539,13 +611,18 @@ impl Gpu {
         let Some(f) = self.camera.fly else { return self.camera.floor };
         let (n, e, _) = f.frame();
         let rad = 1.5 * self.fly_alt;
-        let mut sum = self.terrain.ground_radius(f.dir.normalize(), max_freq);
+        let mut sum = self.terrain.ground_radius_peek(f.dir.normalize(), max_freq);
+        let mut top = sum;
         for k in 0..8 {
             let a = k as f64 * std::f64::consts::FRAC_PI_4;
             let d = (f.dir.normalize() + (n * a.cos() + e * a.sin()) * rad).normalize();
-            sum += self.terrain.ground_radius(d, max_freq);
+            let r = self.terrain.ground_radius_peek(d, max_freq);
+            sum += r;
+            top = top.max(r);
         }
-        sum / 9.0
+        // Half average, half highest point around: the camera still glides over ridges, but a rock or crest
+        // taller than the average can no longer end up around (or in front of) the lens.
+        0.5 * (sum / 9.0 + top)
     }
 
     /// Zoomed in far enough on the globe: drop into the scene over the spot under the camera.
@@ -601,7 +678,7 @@ impl Gpu {
 
     /// Work out what the camera needs (ground + pixels) and upload the triangles.
     fn rebuild(&mut self) {
-        let tiles_before = self.terrain.generated();
+        let t_rebuild = Instant::now();
         let (w, h) = (self.config.width, self.config.height);
         // Height above the ground is what zoom and detail follow: keep it while the ground under the
         // camera rises and falls.
@@ -639,8 +716,9 @@ impl Gpu {
         // Vertices are stored relative to the point on the ground under the camera (keeps f32 precise).
         self.origin = self.camera.eye64().normalize() * if self.hex { 1.0 } else { self.camera.floor };
         let mut vertices = Vec::new();
-        let mut ground: Option<(Vec<PatchKey>, Vec<(PatchKey, global_map_maker::ground::PatchMesh)>)> = None;
+        let mut ground: Option<(Vec<PatchKey>, Vec<PatchKey>, Vec<(PatchKey, PatchMesh)>)> = None;
         let mut light_now = None;
+        let mut ahead_out: Option<Vec<(f64, PatchKey)>> = None;
         if self.hex {
             let r = Resolution::try_from(res).unwrap();
             let cells = visible_hexes(res, &self.camera, w, h);
@@ -650,45 +728,124 @@ impl Gpu {
             let coverage = self.paint.coverage(r);
             vertices = build_hex_cells(&cells, r, &self.paint, &coverage, &highlighted, self.origin);
         } else {
+            let n_new = self.ingest_patches(); // whatever the loader finished since last frame
             self.hover = None;
+            // Nothing new (same camera, same render distance, no mesh arrived): the plan would come out exactly as
+            // last frame, so it is not worked out again (the loader keeps going with its wish list meanwhile).
+            let fly = self.camera.fly.map_or([0.0; 5], |f| [f.dir.x, f.dir.y, f.dir.z, f.heading, f.tilt]);
+            let sig = [self.camera.yaw, self.camera.pitch, self.camera.distance, self.camera.floor, self.render_km, w as f64, h as f64, fly[0], fly[1], fly[2], fly[3], fly[4]];
+            let unchanged = n_new == 0 && self.last_sig == Some(sig);
+            self.last_sig = Some(sig);
+            if !unchanged {
             let tref = self.terrain_ref();
-            let view = PixelView::from_camera(&self.camera, w, h, Some(tref));
+            let view = PixelView::from_camera(&self.camera, w, h, Some(tref)).with_max_dist(self.render_dist());
             let light = self.camera.light_dir();
             let light = DVec3::new(light.x as f64, light.y as f64, light.z as f64).normalize();
             let haze = self.inside().then_some(SKY);
-            let lighting = Lighting::new(light, self.origin, self.camera.eye64(), haze);
+            let mut lighting = Lighting::new(light, self.origin, self.camera.eye64(), haze);
+            if self.inside() {
+                lighting = lighting.with_render_distance(self.render_dist());
+            }
             let patches = visible_patches(&view);
-            let c = crowd(patches.len());
-            let keys: Vec<PatchKey> = patches.iter().map(|id| patch_key(*id, &view, c)).collect();
-            // Only patches not seen before are built (on all cores); the rest are reused as they are.
-            let missing: Vec<PatchKey> = keys.iter().copied().filter(|k| !self.patch_cache.contains_key(k)).collect();
-            let meshes = build_patches(&missing, &view);
-            ground = Some((keys, missing.into_iter().zip(meshes).collect()));
+            let keys: Vec<PatchKey> = patches.iter().map(|id| patch_key(*id, &view)).collect();
+            let ready = |k: &PatchKey| self.patch_cache.contains_key(k);
+            let key_of = |id: PatchId| patch_key(id, &view);
+            let eye = self.camera.eye64();
+            let dist = |k: &PatchKey| (k.id.center_dir() * self.camera.floor - eye).length();
+            let mut plan = plan_frame(&keys, &ready, &self.by_id, &key_of);
+            // Coarse base patches nothing stands in for yet (cold start, long jump) are made right now, so the
+            // ground is never empty; everything finer than that streams in without blocking.
+            let mut built: Vec<(PatchKey, PatchMesh)> = Vec::new();
+            if !plan.holes.is_empty() {
+                let now_keys = plan.holes.clone();
+                built = now_keys.iter().copied().zip(build_patches(&now_keys, &view)).collect();
+                let mut by_id = self.by_id.clone();
+                for (k, _) in &built {
+                    by_id.insert(k.id, *k);
+                }
+                let have: std::collections::HashSet<PatchKey> = built.iter().map(|(k, _)| *k).collect();
+                plan = plan_frame(&keys, &|k| have.contains(k) || ready(k), &by_id, &key_of);
+            }
+            // Missing meshes go to the background loader: first the coarse ancestors of what is wanted (coarse to
+            // fine: they are the stand-ins, so they must exist before the fine ones), then the wanted ones, nearest first.
+            let mut wanted: Vec<(f64, PatchKey)> = plan.chain.iter().filter(|k| !ready(k)).map(|k| (k.id.level as f64 + dist(k) - 100.0, *k)).collect();
+            wanted.extend(plan.missing.iter().map(|k| (dist(k), *k)));
+            // Look ahead while flying: what the view will need a moment from now is loaded in advance.
+            let mut ahead_new: Option<Vec<(f64, PatchKey)>> = None;
+            if self.moving() {
+                if self.frame_no % 4 == 0 {
+                    let mut ahead_list = Vec::new();
+                    let mut cam = self.camera.clone();
+                    if let Some(f) = cam.fly.as_mut() {
+                        let (n, e, _) = f.frame();
+                        let (sh, ch) = f.heading.sin_cos();
+                        let [wk, ak, sk, dk] = self.keys.map(|k| k as i32 as f64);
+                        let mv = (n * ch + e * sh) * (wk - sk) + (e * ch - n * sh) * (dk - ak);
+                        if mv.length() > 0.0 {
+                            let speed = self.fly_alt.max(INSIDE_MIN_ALT) * FLY_SPEED * if self.shift { FLY_BOOST } else { 1.0 };
+                            f.dir = (f.dir.normalize() + mv / mv.length() * speed * AHEAD_SECONDS).normalize();
+                        }
+                    }
+                    let vt = TerrainRef::new(&*self.terrain, &cam, self.config.height as f64);
+                    let va = PixelView::from_camera(&cam, w, h, Some(vt)).with_max_dist(self.render_dist());
+                    let pa = visible_patches(&va);
+                    let ea = cam.eye64();
+                    let ahead_keys: Vec<PatchKey> = pa.iter().map(|id| patch_key(*id, &va)).collect();
+                    for k in &ahead_keys {
+                        if !ready(k) {
+                            ahead_list.push(((k.id.center_dir() * self.camera.floor - ea).length() + 5.0, *k));
+                        }
+                    }
+                    let akey = |id: PatchId| patch_key(id, &va);
+                    for k in global_map_maker::stream::chain_of(&ahead_keys, &akey) {
+                        if !ready(&k) {
+                            ahead_list.push((k.id.level as f64 + (k.id.center_dir() * self.camera.floor - ea).length() + 5.0 - 100.0, k));
+                        }
+                    }
+                    ahead_new = Some(ahead_list);
+                }
+                let src = ahead_new.as_ref().unwrap_or(&self.ahead_wanted);
+                wanted.extend(src.iter().filter(|(_, k)| !ready(k)).copied());
+            } else {
+                ahead_new = Some(Vec::new());
+            }
+            self.streamer.request(wanted);
+            // Wanted meshes and their ancestors count as used, so the cache never throws away the chain a
+            // stand-in is made of (or a fine mesh whose coarse ones are missing).
+            let mut touch = std::mem::take(&mut plan.chain);
+            touch.extend(keys.iter().copied());
+            let draw = plan.draw;
+            ahead_out = ahead_new;
+            self.stats.missing = plan.missing.len();
+            self.stats.drawn = draw.len();
+            ground = Some((draw, touch, built));
             light_now = Some(lighting);
+            }
         }
         if let Some(l) = light_now {
             self.ground_light = l;
         }
-        self.draw_list.clear();
-        if let Some((keys, built)) = ground {
+        if let Some(a) = ahead_out {
+            self.ahead_wanted = a;
+        }
+        if let Some((draw, touch, built)) = ground {
+            self.draw_list.clear();
             self.patch_tick += 1;
             for (k, mesh) in built {
-                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("ground patch"),
-                    size: (mesh.verts.len() * std::mem::size_of::<GroundVertex>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&mesh.verts));
-                self.patch_cache.insert(k, GpuPatch { buf, count: mesh.verts.len() as u32, center: mesh.center, used: 0 });
+                self.insert_patch(k, mesh);
             }
-            let mut inst: Vec<[f32; 4]> = Vec::with_capacity(keys.len());
-            for k in &keys {
+            let mut inst: Vec<[f32; 4]> = Vec::with_capacity(draw.len());
+            for k in touch.iter().chain(self.ahead_wanted.iter().map(|(_, k)| k)) {
+                if let Some(p) = self.patch_cache.get_mut(k) {
+                    p.used = self.patch_tick;
+                }
+            }
+            for k in &draw {
                 if let Some(p) = self.patch_cache.get_mut(k) {
                     p.used = self.patch_tick;
                     let o = p.center - self.origin;
-                    inst.push([o.x as f32, o.y as f32, o.z as f32, 0.0]);
-                    self.draw_list.push((p.buf.clone(), p.count));
+                    inst.push([o.x as f32, o.y as f32, o.z as f32, global_map_maker::pixelview::width_rad(k.id.level) as f32]);
+                    self.draw_list.push((p.buf.clone(), p.index_at, p.count));
                 }
             }
             inst.truncate(MAX_PATCHES);
@@ -696,28 +853,75 @@ impl Gpu {
             self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&inst));
             // Keep the meshes of recently seen patches (flying back and forth is free), drop the oldest beyond that.
             if self.patch_cache.len() > PATCH_CACHE_MAX {
-                let mut ages: Vec<(u64, PatchKey)> = self.patch_cache.iter().map(|(k, p)| (p.used, *k)).collect();
+                let mut ages: Vec<(u64, PatchKey)> = self.patch_cache.iter().filter(|(k, _)| k.id.level > BASE_LEVEL).map(|(k, p)| (p.used, *k)).collect();
                 ages.sort_unstable_by_key(|a| a.0);
-                for (_, k) in ages.into_iter().take(self.patch_cache.len() - PATCH_CACHE_MAX * 2 / 3) {
+                for (_, k) in ages.into_iter().take(self.patch_cache.len().saturating_sub(PATCH_CACHE_MAX * 85 / 100)) {
                     self.patch_cache.remove(&k);
+                    if self.evicted.len() > 100_000 {
+                        self.evicted.clear();
+                    }
+                    self.evicted.insert(k);
+                    if self.by_id.get(&k.id) == Some(&k) {
+                        self.by_id.remove(&k.id);
+                    }
                 }
             }
         }
+        self.frame_no += 1;
 
         vertices.truncate(MAX_VERTS / 3 * 3);
         self.queue.write_buffer(&self.vertex_buf, 0, bytemuck::cast_slice(&vertices));
         self.vertex_count = vertices.len() as u32;
 
         self.rebuild_pixels();
-        self.dirty = gliding; // keep going until the camera has settled on the ground level
-        // Tiles made while building change what the walk should have picked: look again (a few times at most).
-        if self.terrain.generated() != tiles_before && self.settle < 3 {
-            self.settle += 1;
-            self.dirty = true;
-        } else if !self.dirty {
-            self.settle = 0;
-        }
+        // Keep going until the camera has settled on the ground level and the loader has caught up.
+        self.dirty = gliding || self.streamer.busy() > 0;
+        self.stats.rebuild_ms += (t_rebuild.elapsed().as_secs_f64() * 1e3 - self.stats.rebuild_ms) * 0.1;
         self.update_title();
+    }
+
+    /// Puts a finished patch mesh on the GPU and into the cache.
+    fn insert_patch(&mut self, k: PatchKey, mesh: PatchMesh) {
+        // One buffer per patch: the points, then the triangle indices (padded to a multiple of 4 bytes).
+        let index_at = (mesh.ivert.len() * std::mem::size_of::<GroundVertex>()) as u64;
+        let mut index = mesh.index;
+        let count = index.len() as u32;
+        if index.len() % 2 == 1 {
+            index.push(0);
+        }
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ground patch"),
+            size: index_at + (index.len() * 2) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&mesh.ivert));
+        self.queue.write_buffer(&buf, index_at, bytemuck::cast_slice(&index));
+        if self.evicted.remove(&k) {
+            self.stats.reloads += 1;
+        }
+        self.patch_cache.insert(k, GpuPatch { buf, index_at, count, center: mesh.center, used: self.patch_tick });
+        self.by_id.insert(k.id, k);
+    }
+
+    /// Takes in what the background loader finished (a limited number per frame, so uploads never stall a frame).
+    /// Returns how many were taken in. Uploads stop after a few milliseconds, so a burst of finished meshes
+    /// is spread over a few frames instead of stalling one.
+    fn ingest_patches(&mut self) -> usize {
+        let t0 = Instant::now();
+        let mut n = 0;
+        while n < UPLOADS_PER_FRAME && t0.elapsed().as_secs_f64() < UPLOAD_BUDGET_S {
+            let batch = self.streamer.take_done(16);
+            if batch.is_empty() {
+                break;
+            }
+            for (k, mesh) in batch {
+                n += 1;
+                self.stats.meshes += 1;
+                self.insert_patch(k, mesh);
+            }
+        }
+        n
     }
 
     /// The pixel layer (paint + highlight) on top of the ground; the ground mesh stays as it is.
@@ -726,7 +930,7 @@ impl Gpu {
         self.pixel_hover = self.pixel_under_cursor();
         let eye = self.camera.eye64();
         let tref = (!self.hex).then(|| self.terrain_ref());
-        let view = PixelView::from_camera(&self.camera, w, h, tref);
+        let view = PixelView::from_camera(&self.camera, w, h, tref).with_max_dist(self.render_dist());
         let surface = Surface { terrain: tref, lift_px: if tref.is_some() { LIFT_PX } else { 0.0 }, focal_px: view.focal_px };
         let mut quads = visible_pixels(&self.pixels, &view);
         if tref.is_some() {
@@ -759,7 +963,7 @@ impl Gpu {
             ),
             Layer::Pixel => format!(
                 "Global Map Maker | {} | PIXEL layer | {}{} | {} | pixels 1/{} hex | brush {} | {} pixels painted | [ ] pixel size, - = brush, G = {}",
-                if self.hex { "HEX ground" } else if self.inside() { "INSIDE (WASD fly, drag look, scroll height, Esc = space)" } else { "OUTSIDE (zoom in to enter)" },
+                if self.hex { "HEX ground".to_string() } else if self.inside() { format!("INSIDE (WASD fly, drag look, scroll height, view {:.0} km: PgUp/PgDn, Esc = space)", self.render_km) } else { "OUTSIDE (zoom in to enter)".to_string() },
                 self.tool.name(),
                 if matches!(self.tool, Tool::Circle | Tool::Fill) { " (hex layer only)" } else { "" },
                 hexpaint::name(what),
@@ -769,7 +973,40 @@ impl Gpu {
                 if self.hex { "flat sphere, P = hex layer" } else { "hex ground" }
             ),
         };
-        self.window.set_title(&title);
+        // Loading readout (inside scene): what is still wanted but not made, and how fast the loader works.
+        if self.inside() && !self.hex {
+            let now = Instant::now();
+            let dt = now.duration_since(self.stats.t).as_secs_f64();
+            if dt >= 1.0 {
+                let (made, disk) = (self.terrain.generated(), self.terrain.from_disk());
+                self.stats.line = format!(
+                    "LOAD missing {} | queue {} | tiles {:.0}/s made {:.0}/s disk | meshes {:.0}/s | reloads {} | drawn {} | rebuild {:.1} ms",
+                    self.stats.missing,
+                    self.streamer.busy(),
+                    (made - self.stats.gen0) as f64 / dt,
+                    (disk - self.stats.disk0) as f64 / dt,
+                    self.stats.meshes as f64 / dt,
+                    self.stats.reloads,
+                    self.stats.drawn,
+                    self.stats.rebuild_ms
+                );
+                self.stats.t = now;
+                self.stats.gen0 = made;
+                self.stats.disk0 = disk;
+                self.stats.meshes = 0;
+                self.stats.reloads = 0;
+            }
+        }
+        let title = if self.stats.line.is_empty() || !self.inside() || self.hex {
+            title
+        } else {
+            title.replacen("Global Map Maker | ", &format!("Global Map Maker | {} | ", self.stats.line), 1)
+        };
+        // Setting the title is slow on some systems (it repaints the window frame): only when it changed.
+        if title != self.last_title {
+            self.window.set_title(&title);
+            self.last_title = title;
+        }
     }
 
     fn cell_under_cursor(&self) -> Option<CellIndex> {
@@ -1058,7 +1295,7 @@ impl Gpu {
             let sky = l.haze.unwrap_or([0.0; 3]);
             let mut g = [0f32; 36];
             g[..16].copy_from_slice(&m.to_cols_array());
-            g[16..20].copy_from_slice(&f(l.sun, 0.0));
+            g[16..20].copy_from_slice(&f(l.sun, Camera::focal_px(self.config.height as f64) as f32));
             g[20..24].copy_from_slice(&f(l.eye_rel, l.horizon as f32));
             g[24..28].copy_from_slice(&f(l.origin, 0.0));
             g[28..32].copy_from_slice(&[sky[0], sky[1], sky[2], if l.haze.is_some() { 1.0 } else { 0.0 }]);
@@ -1113,9 +1350,10 @@ impl Gpu {
                 pass.set_pipeline(&self.ground_pipeline);
                 pass.set_bind_group(0, &self.ground_bind, &[]);
                 pass.set_vertex_buffer(1, self.inst_buf.slice(..));
-                for (k, (buf, count)) in self.draw_list.iter().enumerate() {
-                    pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw(0..*count, k as u32..k as u32 + 1);
+                for (k, (buf, index_at, count)) in self.draw_list.iter().enumerate() {
+                    pass.set_vertex_buffer(0, buf.slice(..*index_at));
+                    pass.set_index_buffer(buf.slice(*index_at..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(0..*count, 0, k as u32..k as u32 + 1);
                 }
             }
             if self.pixel_count > 0 {
@@ -1267,6 +1505,18 @@ impl ApplicationHandler for App {
                         gpu.window.request_redraw();
                     } else if slot.is_some() && event.state == ElementState::Released {
                         gpu.keys[slot.unwrap()] = false;
+                    }
+                }
+                if event.state == ElementState::Pressed && gpu.inside() {
+                    let k = match event.logical_key {
+                        Key::Named(NamedKey::PageUp) => Some(1.25),
+                        Key::Named(NamedKey::PageDown) => Some(0.8),
+                        _ => None,
+                    };
+                    if let Some(k) = k {
+                        gpu.render_km = (gpu.render_km * k).clamp(RENDER_KM_MIN, RENDER_KM_MAX);
+                        gpu.dirty = true;
+                        gpu.window.request_redraw();
                     }
                 }
                 if event.state == ElementState::Pressed && !event.repeat && event.logical_key == Key::Named(NamedKey::Escape) {

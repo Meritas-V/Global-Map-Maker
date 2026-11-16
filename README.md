@@ -70,6 +70,7 @@ Rough shape: header (magic, version, planet settings) -> per-face quadtree chunk
 | Inside: fly (Shift = faster) | W A S D |
 | Inside: height (scroll out past the top = back to space) | scroll |
 | Inside: back to space | Esc |
+| Inside: render distance (shorter = faster) | PageUp / PageDown (title shows km) |
 | Ground: flat sphere with terrain (default) or hex grid | G |
 | Switch hex / pixel layer | P |
 | Pixel size (pixel layer) | [ and ] |
@@ -89,3 +90,6 @@ The grid detail follows the zoom (H3 hexagons, down to about 1 m on an Earth-siz
 ## License
 
 TBD.
+
+## Tile cache
+Height tiles are saved to `cache/tiles/` (ignored by git) and the coarse levels are made in the background on the first run (~140 MB). Changing the terrain function starts a new cache folder automatically; delete old folders in `cache/tiles/` to reclaim space.

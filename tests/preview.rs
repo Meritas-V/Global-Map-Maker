@@ -89,9 +89,9 @@ fn find_site(t: &Terrain, target: f64, k: usize) -> DVec3 {
         let r = (1.0 - z * z).sqrt();
         let d = DVec3::new(r * a.cos(), r * a.sin(), z);
         let h = t.height_m(d, 5_000.0);
-        if (h - target).abs() < 250.0 {
+        if (h - target).abs() < if target < 1_000.0 { 60.0 } else { 250.0 } {
             let fine = t.height_m(d, 200.0);
-            if (fine - h).abs() > 50.0 {
+            if target < 1_000.0 || (fine - h).abs() > 50.0 {
                 found += 1;
                 if found > k {
                     println!("site {target} m: coarse {h:.0}, fine {fine:.0} at {d:?}");
@@ -109,7 +109,7 @@ fn preview() {
     let tiles = TileStore::new(Terrain::new(2026));
     let (w, h) = (640usize, 360usize);
     let tag = std::env::var("PREVIEW_TAG").unwrap_or_else(|_| "x".into());
-    let sites = [(2_300.0, 11usize), (4_300.0, 7usize)];
+    let sites = [(150.0, 20usize), (2_300.0, 11usize), (4_300.0, 7usize)];
     // (name, km south of the site, altitude m, heading, tilt)
     let views: [(&str, f64, f64, f64, f64); 2] = [("far", 60.0, 3_000.0, 0.0, -0.12), ("near", 18.0, 1_500.0, 0.0, -0.08)];
     let mut idx = 0;

@@ -28,7 +28,11 @@ pub const MAX_QUADS: usize = 120_000;
 /// With terrain, a painted pixel bigger than this on screen is cut into smaller pieces that follow the relief.
 pub const PIECE_PX: f64 = 56.0;
 /// Painted pixels sit this many screen pixels above the terrain, so the depth test never hides them.
-pub const LIFT_PX: f64 = 4.0;
+pub const LIFT_PX: f64 = 8.0;
+/// The ground mesh is a coarse (mesh point every few screen pixels) approximation of the terrain function the paint is
+/// placed with, so rocks and ridges can poke up through a quad lying exactly on the function. Paint is therefore also
+/// pulled this fraction of its distance toward the eye (along the line of sight: it looks the same, but wins the depth test).
+pub const PULL: f64 = 0.015;
 
 pub struct Quad {
     pub id: PixelId,
@@ -47,6 +51,8 @@ pub struct PixelView<'a> {
     pub tan_y: f64,
     pub tan_x: f64,
     pub terrain: Option<TerrainRef<'a>>,
+    /// Render distance (globe radii from the eye): nothing farther is considered. Infinite = no limit.
+    pub max_dist: f64,
 }
 
 impl<'a> PixelView<'a> {
@@ -63,7 +69,14 @@ impl<'a> PixelView<'a> {
             tan_y,
             tan_x: tan_y * w / h,
             terrain,
+            max_dist: f64::INFINITY,
         }
+    }
+
+    /// The same view with a render distance.
+    pub fn with_max_dist(mut self, d: f64) -> PixelView<'a> {
+        self.max_dist = d;
+        self
     }
 }
 
@@ -86,7 +99,7 @@ pub fn is_visible(id: PixelId, view: &PixelView) -> bool {
     let relief = if view.terrain.is_some() { (0.7 * w).min(1.5e-3) } else { 0.0 };
     let rho = 1.1 * w + relief;
     let z = -v.z;
-    if z + rho <= 0.0 {
+    if z + rho <= 0.0 || v.length() - rho > view.max_dist {
         return false;
     }
     v.x.abs() <= z * view.tan_x + rho * (1.0 + view.tan_x * view.tan_x).sqrt()
@@ -178,7 +191,8 @@ impl<'a> Surface<'a> {
     fn point(&self, u: DVec3, eye: DVec3, radius: f64) -> DVec3 {
         let p = u * radius;
         if self.terrain.is_some() {
-            p + u * self.lift_at(p, eye)
+            let lifted = p + u * self.lift_at(p, eye);
+            lifted + (eye - lifted) * PULL
         } else {
             p
         }
@@ -206,14 +220,14 @@ pub fn build_vertices(quads: &[Quad], origin: DVec3, eye: DVec3, surface: &Surfa
             None => (((w / 0.03).ceil() as usize).clamp(1, 8), false),
         };
         let center_radius = match (surface.terrain, center_only) {
-            (Some(t), true) => Some(t.radius(q.id.center_dir())),
+            (Some(t), true) => Some(t.radius_peek(q.id.center_dir())),
             _ => None,
         };
         let at = |i: usize, j: usize| {
             let u = q.id.dir_at(i as f64 / n as f64, j as f64 / n as f64);
             let r = match (surface.terrain, center_radius) {
                 (_, Some(r)) => r,
-                (Some(t), None) => t.radius(u),
+                (Some(t), None) => t.radius_peek(u),
                 (None, None) => 1.0,
             };
             let p = surface.point(u, eye, r);
@@ -260,7 +274,7 @@ pub fn pick_pixel(
 ) -> Option<PixelId> {
     let (origin, dir) = pick_ray(camera, width, height, x, y);
     let p = match terrain {
-        Some(t) => t.pick(origin, dir)?,
+        Some(t) => t.pick_peek(origin, dir)?,
         None => {
             let b = origin.dot(dir);
             let disc = b * b - (origin.dot(origin) - 1.0);
