@@ -56,6 +56,28 @@ Start with heightmap + layers and see if it's enough.
 **File format:** sparse and chunked, since most of the planet stays coarse.
 Rough shape: header (magic, version, planet settings) -> per-face quadtree chunks -> terrain palette -> optional layers. Compress chunks. Keep it versioned from day one.
 
+## Controls (hex mode, the default)
+| What | How |
+|---|---|
+| Turn the globe / zoom | left-drag / scroll |
+| Use the current tool | right mouse (drag for pencil, eraser, line, circle) |
+| Color | 1-9 (deep red, grass, forest, sand, rock, snow, dirt, shallow water, deep water) |
+| Tools | B pencil, E or 0 eraser, L line, C circle (Shift = outline), F fill, I eyedropper |
+| Brush size | [ and ] |
+| Undo | Ctrl+Z |
+| Zoom in on the globe past ~190 km: enter the Inside scene (fly over the land) | scroll |
+| Inside: look around | left-drag |
+| Inside: fly (Shift = faster) | W A S D |
+| Inside: height (scroll out past the top = back to space) | scroll |
+| Inside: back to space | Esc |
+| Ground: flat sphere with terrain (default) or hex grid | G |
+| Switch hex / pixel layer | P |
+| Pixel size (pixel layer) | [ and ] |
+| Pixel brush radius (pixel layer) | - and = |
+| Switch globe type | G (smooth / faceted / hex) |
+
+The grid detail follows the zoom (H3 hexagons, down to about 1 m on an Earth-sized globe). Painting is per level: painting a big hex wipes the finer paint inside it, and zooming out shows the average. The bottom-left corner shows a distance scale bar (Earth-sized globe) and a ladder of the 16 zoom levels.
+
 ## Open questions
 
 - How many zoom levels, and how big is one cell in real-world terms at each?

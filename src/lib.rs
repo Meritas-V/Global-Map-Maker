@@ -1,5 +1,13 @@
 //! Global Map Maker core. Windowless on purpose: the sphere, detail and mesh logic is testable without a GPU.
 pub mod camera;
-pub mod lod;
+pub mod ground;
+pub mod hexmesh;
+pub mod hexpaint;
+pub mod hexview;
 pub mod mesh;
-pub mod sphere;
+pub mod overlay;
+pub mod pixelpaint;
+pub mod pixelview;
+pub mod terrain;
+pub mod tiles;
+pub mod tools;
