@@ -19,6 +19,10 @@ struct State {
     done: Vec<(PatchKey, PatchMesh)>,
     /// Keys in `done`, so a mesh finished but not picked up yet is not asked for again.
     done_keys: HashSet<PatchKey>,
+    /// Meshes to make again right away (their ground was edited), best last. Before `pending`.
+    urgent: Vec<PatchKey>,
+    /// Being made now, but edited again meanwhile: make once more when it finishes.
+    redo: HashSet<PatchKey>,
     quit: bool,
 }
 
@@ -36,7 +40,7 @@ pub struct Streamer {
 impl Streamer {
     pub fn new(terrain: Arc<dyn HeightSource + Send + Sync>, workers: usize) -> Streamer {
         let shared = Arc::new(Shared {
-            state: Mutex::new(State { pending: Vec::new(), in_flight: HashSet::new(), done: Vec::new(), done_keys: HashSet::new(), quit: false }),
+            state: Mutex::new(State { pending: Vec::new(), in_flight: HashSet::new(), done: Vec::new(), done_keys: HashSet::new(), urgent: Vec::new(), redo: HashSet::new(), quit: false }),
             wake: Condvar::new(),
             terrain,
         });
@@ -65,6 +69,26 @@ impl Streamer {
         self.shared.wake.notify_all();
     }
 
+    /// These meshes are out of date (the ground under them was edited): make them again, before anything else.
+    /// A mesh finished but not picked up yet is dropped, and one being made right now is made again after.
+    pub fn rebuild(&self, keys: &[PatchKey]) {
+        let mut st = self.shared.state.lock().unwrap();
+        for k in keys {
+            if st.in_flight.contains(k) {
+                st.redo.insert(*k);
+                continue;
+            }
+            if st.done_keys.remove(k) {
+                st.done.retain(|(d, _)| d != k);
+            }
+            if !st.urgent.contains(k) {
+                st.urgent.push(*k);
+            }
+        }
+        drop(st);
+        self.shared.wake.notify_all();
+    }
+
     /// Finished meshes (at most `max`).
     pub fn take_done(&self, max: usize) -> Vec<(PatchKey, PatchMesh)> {
         let mut st = self.shared.state.lock().unwrap();
@@ -79,7 +103,7 @@ impl Streamer {
     /// Meshes still waiting or being made, plus finished ones not picked up yet.
     pub fn busy(&self) -> usize {
         let st = self.shared.state.lock().unwrap();
-        st.pending.len() + st.in_flight.len() + st.done.len()
+        st.pending.len() + st.urgent.len() + st.in_flight.len() + st.done.len()
     }
 }
 
@@ -101,6 +125,10 @@ fn worker(sh: Arc<Shared>) {
                 if st.quit {
                     return;
                 }
+                if let Some(k) = st.urgent.pop() {
+                    st.in_flight.insert(k);
+                    break k;
+                }
                 if let Some((_, k)) = st.pending.pop() {
                     st.in_flight.insert(k);
                     break k;
@@ -111,8 +139,13 @@ fn worker(sh: Arc<Shared>) {
         let mesh = build_patch_from(key, Some(&*sh.terrain));
         let mut st = sh.state.lock().unwrap();
         st.in_flight.remove(&key);
-        st.done_keys.insert(key);
-        st.done.push((key, mesh));
+        if st.redo.remove(&key) {
+            // Edited while it was being made: this one is out of date, never show it.
+            st.urgent.push(key);
+        } else {
+            st.done_keys.insert(key);
+            st.done.push((key, mesh));
+        }
     }
 }
 

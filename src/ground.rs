@@ -28,6 +28,11 @@ pub struct GroundVertex {
     /// The surface normal the parent patch's mesh has at this spot (xyz, 1/127 steps); blended with `nrm` by the
     /// same factor as `morph`, so lighting does not jump at a level change either.
     pub nrm_p: [i8; 4],
+    /// Biome ground cover colour (rgb) and how sandy its beaches are (a), all 0..255 = 0..1.
+    pub cover: [u8; 4],
+    /// How much of a beach this point is (0 = grass, 1 = sand/stone): from a smoothed height, then cleaned up with the
+    /// neighbours (a point whose neighbours are all beach is beach, even if its own height is a bit over the line).
+    pub shore: f32,
 }
 
 /// Steepness (0..~0.6) is stored times this in a signed byte.
@@ -59,17 +64,26 @@ pub struct Lighting {
     pub horizon: f64,
     /// Some(sky color) fades far ground into the sky.
     pub haze: Option<[f32; 3]>,
+    /// Meters added to heights when choosing colours (the planet's sea level), see `terrain::color_in_range_s`.
+    pub alt_shift: f64,
 }
 
 impl Lighting {
     /// With a render distance, fog is fully thick a little before it, so the cut-off edge never shows.
     pub fn with_render_distance(mut self, d: f64) -> Lighting {
-        self.horizon = self.horizon.min(0.85 * d);
+        // The fog is as far as the sphere's horizon, but never nearer than about a third of the render distance:
+        // near the ground the horizon is a few km away, and hills beyond it were fogged out completely.
+        self.horizon = self.horizon.max(0.35 * d).min(0.85 * d);
         self
     }
 
     pub fn new(sun: DVec3, origin: DVec3, eye: DVec3, haze: Option<[f32; 3]>) -> Lighting {
-        Lighting { sun, origin, eye_rel: eye - origin, horizon: (eye.length_squared() - 1.0).max(1e-18).sqrt(), haze }
+        Lighting { sun, origin, eye_rel: eye - origin, horizon: (eye.length_squared() - 1.0).max(1e-18).sqrt(), haze, alt_shift: 0.0 }
+    }
+
+    pub fn with_alt_shift(mut self, meters: f64) -> Lighting {
+        self.alt_shift = meters;
+        self
     }
 }
 
@@ -90,13 +104,18 @@ pub fn lit(base: [f32; 3], n_dot_sun: f64, n_dot_up: f64) -> [f32; 3] {
 /// The color of one pixel of ground. The CPU twin of `fs_main` in ground.wgsl (used by tests and the
 /// software preview); keep the two in step.
 pub fn shade(h: f64, range_h: f64, nrm: [f32; 3], steep: f32, rel: DVec3, light: &Lighting) -> [f32; 3] {
+    shade_cover(h, range_h, nrm, steep, rel, light, crate::planet::DEFAULT_COVER, 1.0)
+}
+
+/// `shade` with the biome's ground cover colour.
+pub fn shade_cover(h: f64, range_h: f64, nrm: [f32; 3], steep: f32, rel: DVec3, light: &Lighting, cover: [f32; 3], sandy: f32) -> [f32; 3] {
     let up = (light.origin + rel).normalize();
     let (n, base) = if h < 0.0 {
         // Open water is a flat sphere: shade it as one, tinted by depth.
         (up, terrain::color(h, 0.0))
     } else {
         let n = DVec3::new(nrm[0] as f64, nrm[1] as f64, nrm[2] as f64).normalize();
-        (n, terrain::color_in_range(h, range_h, steep as f64))
+        (n, terrain::color_in_range_s(h, range_h, steep as f64, cover, sandy, light.alt_shift))
     };
     let mut color = lit(base, n.dot(light.sun), n.dot(up));
     if let Some(sky) = light.haze {
@@ -111,6 +130,37 @@ pub fn shade(h: f64, range_h: f64, nrm: [f32; 3], steep: f32, rel: DVec3, light:
 /// 112 with twice the pieces per edge (16 instead of 8): the mesh points and height-tile samples are still
 /// ~7 px apart, so the ground is as sharp as with 56 px / 8 pieces, but there are 4x fewer patches (draw calls,
 /// meshes, loader jobs) and the same number of tiles.
+/// The tile level the beach colours read their height at (cells of about 1.2 km: few tiles cover the whole view, and
+/// every patch reads the same one, so the beach does not change with the level of detail).
+pub const SHORE_LEVEL: u8 = 7;
+
+/// Debug switch (F3 in the app): the neighbour rule for beaches.
+pub static BEACH_NEIGHBOUR_RULE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The neighbour rule on an m x m grid of beach weights: a point is at least as much beach as the least beachy of its
+/// 8 neighbours, so a grass point whose neighbours are all sand becomes sand. (The outer ring is left as it is.)
+pub fn fill_beach(b: &[f32], m: usize) -> Vec<f32> {
+    let mut out = b.to_vec();
+    for gj in 1..m - 1 {
+        for gi in 1..m - 1 {
+            let mut lowest = f32::MAX;
+            for dj in 0..3 {
+                for di in 0..3 {
+                    if di != 1 || dj != 1 {
+                        lowest = lowest.min(b[(gj + dj - 1) * m + gi + di - 1]);
+                    }
+                }
+            }
+            out[gj * m + gi] = b[gj * m + gi].max(lowest);
+        }
+    }
+    out
+}
+
+fn smoothstep32(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 pub const GROUND_PX: f64 = 56.0;
 pub const GROUND_PX_INSIDE: f64 = 112.0;
 /// Farther away the limit grows (far ground is hazy and small: fewer, bigger patches, coarser tiles, fewer draw
@@ -212,6 +262,9 @@ pub struct PatchMesh {
     /// ... and the triangles as indices into `ivert`. This is what goes to the GPU: about 4x smaller than `verts`,
     /// so four times as many patches fit in the cache, and the vertex shader runs once per point, not once per corner.
     pub index: Vec<u16>,
+    /// The hand-edit version the ground had while this was made (u64::MAX if it changed meanwhile): tells which
+    /// strokes it already shows.
+    pub edit_version: u64,
 }
 
 /// Allowed numbers of pieces per patch edge: few sizes, so meshes are reused as the view changes a little.
@@ -272,6 +325,7 @@ pub fn build_patch(key: PatchKey, view: &PixelView) -> PatchMesh {
 /// The same from the height source alone (what the background loader has: no camera).
 pub fn build_patch_from(key: PatchKey, terrain: Option<&dyn terrain::HeightSource>) -> PatchMesh {
     let (id, n) = (key.id, key.n as usize);
+    let v_start = terrain.map_or(0, |t| t.edit_version());
     let w = width_rad(id.level);
     let center = id.center_dir();
     let freq = tiles::freq_for_level(key.lvl);
@@ -281,6 +335,9 @@ pub fn build_patch_from(key: PatchKey, terrain: Option<&dyn terrain::HeightSourc
     let mut shape = vec![DVec3::ZERO; m * m]; // same points with exaggerated height, for lighting only
     let mut hgt = vec![0.0f64; m * m];
     let mut rng = vec![0.0f64; m * m]; // coarse height, for the mountain-range tint
+    let mut cov = vec![[0u8; 4]; m * m]; // biome ground cover colour
+    let mut shore = vec![0.0f32; m * m]; // smoothed height (plus sea level shift) for the beach colours
+    let shift = terrain.map_or(0.0, |t| t.alt_shift());
     for gj in 0..m {
         for gi in 0..m {
             let u = id.dir_at((gi as f64 - 1.0) / n as f64, (gj as f64 - 1.0) / n as f64);
@@ -290,6 +347,12 @@ pub fn build_patch_from(key: PatchKey, terrain: Option<&dyn terrain::HeightSourc
                     let h = t.height_m(u, freq);
                     // The range tint is only needed where a vertex is drawn, not in the padding ring.
                     let rh = if interior { t.height_m(u, terrain::RANGE_FREQ) } else { 0.0 };
+                    // The beach height is smoother than the mesh: read two tile levels coarser than this patch (at most
+                    // SHORE_LEVEL, the same for every close-up patch). With the exact height, the metre-scale bumps of the
+                    // ground crossed the sand/green ramp at every mesh point and speckled the beach. (The ring around the
+                    // patch needs it too: the neighbour rule below looks at it.)
+                    let sl = (key.lvl as i32 - 2).clamp(0, SHORE_LEVEL as i32) as u8;
+                    shore[gj * m + gi] = (t.height_m(u, tiles::freq_for_level(sl)) + shift).max(0.0) as f32;
                     (h, 1.0 + h.max(0.0) / terrain::EARTH_RADIUS_M, rh)
                 }
                 None => (0.0, 1.0, 0.0),
@@ -300,6 +363,33 @@ pub fn build_patch_from(key: PatchKey, terrain: Option<&dyn terrain::HeightSourc
             rng[gj * m + gi] = rh;
         }
     }
+    // Biome colours from a slightly blurred height (3x3, 1-2-1): the climate changes quickly with altitude, and read at
+    // the exact height of every mesh point a steep slope turned the colours into stairs along the triangles (most
+    // visible at a plateau's rim seen from far). The blur spreads the change over a few points.
+    if let Some(t) = terrain {
+        let spacing_m = w * terrain::EARTH_RADIUS_M / n as f64;
+        let amp = 1.0 - smoothstep32(200.0, 1200.0, spacing_m as f32);
+        for gj in 1..=n + 1 {
+            for gi in 1..=n + 1 {
+                let u = id.dir_at((gi as f64 - 1.0) / n as f64, (gj as f64 - 1.0) / n as f64);
+                let at = |i: usize, j: usize| hgt[j * m + i];
+                let hb = (4.0 * at(gi, gj)
+                    + 2.0 * (at(gi - 1, gj) + at(gi + 1, gj) + at(gi, gj - 1) + at(gi, gj + 1))
+                    + (at(gi - 1, gj - 1) + at(gi + 1, gj - 1) + at(gi - 1, gj + 1) + at(gi + 1, gj + 1)))
+                    / 16.0;
+                let c = t.cover(u, hb);
+                // Sand or stone: the biome's value, with a slow wobble along the coast made here (once, from the
+                // direction) rather than per pixel. Far patches have mesh points too far apart to show it.
+                let base = t.sandy(u, hb);
+                let sandy = (base + amp * t.beach_noise(u) * (1.0 - (2.0 * base - 1.0).abs() * 0.5)).clamp(0.0, 1.0);
+                cov[gj * m + gi] = [(c[0] * 255.0 + 0.5) as u8, (c[1] * 255.0 + 0.5) as u8, (c[2] * 255.0 + 0.5) as u8, (sandy * 255.0 + 0.5) as u8];
+            }
+        }
+    }
+    // Beach weight per point: 1 on the sand, falling to 0 over 4..40 m of (smoothed) height. Then the neighbour rule:
+    // a point is at least as much beach as the least beachy of its 8 neighbours.
+    let beach0: Vec<f32> = shore.iter().map(|&hs| 1.0 - smoothstep32(4.0, 40.0, hs)).collect();
+    let beach = if BEACH_NEIGHBOUR_RULE.load(std::sync::atomic::Ordering::Relaxed) { fill_beach(&beach0, m) } else { beach0 };
     let vertex = |i: usize, j: usize| {
         let (gi, gj) = (i + 1, j + 1);
         let p = pos[gj * m + gi];
@@ -329,6 +419,8 @@ pub fn build_patch_from(key: PatchKey, terrain: Option<&dyn terrain::HeightSourc
                 hr: [h as f32, rng[gj * m + gi] as f32],
                 morph: 0.0,
                 nrm_p: [0; 4],
+                cover: cov[gj * m + gi],
+                shore: beach[gj * m + gi],
             },
             up,
         )
@@ -473,7 +565,8 @@ pub fn build_patch_from(key: PatchKey, terrain: Option<&dyn terrain::HeightSourc
         strip((0, k), (0, k + 1));
         strip((n, k), (n, k + 1));
     }
-    PatchMesh { center, verts: out, ivert, index }
+    let v_end = terrain.map_or(0, |t| t.edit_version());
+    PatchMesh { center, verts: out, ivert, index, edit_version: if v_start == v_end { v_start } else { u64::MAX } }
 }
 
 /// Builds many meshes on all cores (results in the same order as `keys`).
@@ -585,8 +678,29 @@ mod tests {
     }
 
     #[test]
+    fn a_point_inside_the_beach_becomes_beach_but_a_real_grass_strip_stays() {
+        let m = 7;
+        let mut b = vec![1.0f32; m * m];
+        b[3 * m + 3] = 0.0; // one green point among sand
+        assert_eq!(fill_beach(&b, m)[3 * m + 3], 1.0);
+        // A two-point-wide green strip: each point has a green neighbour, so it stays green.
+        let mut g = vec![1.0f32; m * m];
+        for j in 0..m {
+            g[j * m + 3] = 0.0;
+            g[j * m + 4] = 0.0;
+        }
+        let f = fill_beach(&g, m);
+        assert_eq!(f[3 * m + 3], 0.0);
+        assert_eq!(f[3 * m + 4], 0.0);
+        // A lone sand speck in grass stays a speck (the rule only fills holes in the sand).
+        let mut s = vec![0.0f32; m * m];
+        s[3 * m + 3] = 1.0;
+        assert_eq!(fill_beach(&s, m)[3 * m + 2], 0.0);
+    }
+
+    #[test]
     fn per_pixel_shading_matches_the_vertex_format() {
-        let v = GroundVertex { pos: [0.0; 3], nrm: [0, 127, 0, 50], hr: [10.0, 10.0], morph: 0.0, nrm_p: [0, 127, 0, 0] };
+        let v = GroundVertex { pos: [0.0; 3], nrm: [0, 127, 0, 50], hr: [10.0, 10.0], morph: 0.0, nrm_p: [0, 127, 0, 0], cover: [56, 107, 20, 255], shore: 0.0 };
         assert!((v.normal()[1] - 1.0).abs() < 1e-6);
         assert!((v.steepness() - 50.0 / 127.0 / 1.6).abs() < 1e-6);
     }

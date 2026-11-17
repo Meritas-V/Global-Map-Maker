@@ -23,7 +23,7 @@ use std::f64::consts::FRAC_PI_2;
 
 /// Cells along a tile edge (the tile has (N+1)^2 height samples, edges shared with neighbours).
 pub const TILE_N: usize = 64;
-const SAMPLES: usize = TILE_N + 1;
+pub const SAMPLES: usize = TILE_N + 1;
 /// Erosion passes per tile.
 pub const ERODE_ITERS: usize = 6;
 /// Extra samples around a tile while it is generated: as many as the erosion reaches.
@@ -61,6 +61,15 @@ pub struct Tile {
 }
 
 impl Tile {
+    /// A tile of all zeros (for edit layers).
+    pub fn zeros() -> Tile {
+        Tile { h: vec![0.0; SAMPLES * SAMPLES] }
+    }
+
+    pub fn values_mut(&mut self) -> &mut [f32] {
+        &mut self.h
+    }
+
     /// Height at fractions (0..1) across the tile, bilinear.
     pub fn bilinear(&self, fx: f64, fy: f64) -> f64 {
         let gx = (fx.clamp(0.0, 1.0) * TILE_N as f64).min(TILE_N as f64 - 1e-9);
@@ -277,6 +286,8 @@ pub struct TileStore {
     made: Condvar,
     disk: Option<DiskCache>,
     from_disk: AtomicUsize,
+    /// Hand edits on top of the generated ground (see edits.rs).
+    edits: crate::edits::EditLayer,
 }
 
 impl TileStore {
@@ -295,6 +306,7 @@ impl TileStore {
             made: Condvar::new(),
             disk: None,
             from_disk: AtomicUsize::new(0),
+            edits: crate::edits::EditLayer::default(),
         }
     }
 
@@ -490,30 +502,94 @@ impl HeightSource for TileStore {
         }
     }
 
-    /// Blends the two tile levels around the one the detail limit asks for, so detail fades in smoothly while zooming.
+    fn cover(&self, d: DVec3, h: f64) -> [f32; 3] {
+        self.terrain.cover_at(d, h)
+    }
+
+    fn sandy(&self, d: DVec3, h: f64) -> f32 {
+        HeightSource::sandy(&self.terrain, d, h)
+    }
+
+    fn alt_shift(&self) -> f64 {
+        HeightSource::alt_shift(&self.terrain)
+    }
+
+    fn edit_version(&self) -> u64 {
+        self.edits.version()
+    }
+
+    fn beach_noise(&self, d: DVec3) -> f32 {
+        HeightSource::beach_noise(&self.terrain, d)
+    }
+
+    /// Terrain plus hand edits.
     fn height_m(&self, d: DVec3, max_freq: f64) -> f64 {
         let l = level_for(max_freq);
-        let lo = l.floor() as u8;
-        let t = l - lo as f64;
-        let a = self.sample(d, lo);
-        if t < 1e-3 || lo >= MAX_TILE_LEVEL {
-            return a;
-        }
-        let b = self.sample(d, lo + 1);
-        a + (b - a) * t
+        self.damped_base(d, l, false) + self.edits.at(d, l)
     }
 
     /// The same without ever making a tile (coarser data stands in for what is missing).
     fn height_m_peek(&self, d: DVec3, max_freq: f64) -> f64 {
         let l = level_for(max_freq);
+        self.damped_base(d, l, true) + self.edits.at(d, l)
+    }
+}
+
+impl TileStore {
+    pub fn edits(&self) -> &crate::edits::EditLayer {
+        &self.edits
+    }
+
+    /// Ground height (terrain and every edit) as an edit tool at tile `level` should see it.
+    pub fn height_for_edit(&self, d: DVec3, level: u8) -> f64 {
+        self.damped_base(d, level as f64, false) + self.edits.at(d, level as f64 + 3.0)
+    }
+
+    /// The same without ever making a tile (coarser data stands in): for looks, not for the edit itself.
+    pub fn height_for_edit_peek(&self, d: DVec3, level: u8) -> f64 {
+        self.damped_base(d, level as f64, true) + self.edits.at(d, level as f64 + 3.0)
+    }
+
+    fn base_at_level(&self, d: DVec3, l: f64, peek: bool) -> f64 {
         let lo = l.floor() as u8;
         let t = l - lo as f64;
-        let a = self.sample_peek(d, lo);
+        let get = |lv: u8| if peek { self.sample_peek(d, lv) } else { self.sample(d, lv) };
+        let a = get(lo);
         if t < 1e-3 || lo >= MAX_TILE_LEVEL {
             return a;
         }
-        let b = self.sample_peek(d, lo + 1);
-        a + (b - a) * t
+        a + (get(lo + 1) - a) * t
+    }
+
+    /// The generated ground seen at tile level `l`, with the detail dampers of smoothed places applied: where a
+    /// damper of level `e` is `m`, whatever the ground has finer than level `e` is turned down by `m`. Dampers
+    /// apply from the coarsest to the finest, each on what the ones before left.
+    fn damped_base(&self, d: DVec3, l: f64, peek: bool) -> f64 {
+        if !self.edits.has_damp() {
+            return self.base_at_level(d, l, peek);
+        }
+        let levels = self.edits.damp_level_list();
+        let mut layers: Vec<(u8, f64)> = Vec::new();
+        for e in levels {
+            if (e as f64) < l {
+                let m = self.edits.damp_at(d, e);
+                if m > 1e-4 {
+                    layers.push((e, m));
+                }
+            }
+        }
+        layers.truncate(5);
+        self.damped_rec(d, l, peek, &layers, layers.len())
+    }
+
+    fn damped_rec(&self, d: DVec3, l: f64, peek: bool, layers: &[(u8, f64)], n: usize) -> f64 {
+        if n == 0 {
+            return self.base_at_level(d, l, peek);
+        }
+        let (e, m) = layers[n - 1];
+        let a = self.damped_rec(d, l, peek, layers, n - 1);
+        let b = self.damped_rec(d, e as f64, peek, layers, n - 1);
+        a - m * (a - b)
     }
 }
 
@@ -528,6 +604,44 @@ mod tests {
         let a = k * 2.399963229728653;
         let r = (1.0 - z * z).sqrt();
         DVec3::new(r * a.cos(), r * a.sin(), z)
+    }
+
+    #[test]
+    fn the_edit_version_tells_a_mesh_which_strokes_it_has_seen() {
+        let s = store();
+        let v0 = HeightSource::edit_version(&s);
+        let c = dir(777);
+        s.edits().stroke(8, c, 3_000.0, |_, _| 1.0);
+        let v1 = HeightSource::edit_version(&s);
+        assert!(v1 > v0);
+        // A mesh made now (reads v1) is not older than the stroke; one made before (v0) is.
+        assert!(v0 <= v0 && !(v1 <= v0));
+    }
+
+    #[test]
+    fn a_smoothed_place_stays_smooth_when_zoomed_in() {
+        let s = store();
+        let c = dir(12345);
+        let e = 8u8;
+        let fine = 11u8;
+        let probe: Vec<DVec3> = (0..6).map(|k| (c + DVec3::new(0.0, 0.0, 1.0).cross(c).normalize() * (k as f64 * 40.0 / EARTH_RADIUS_M)).normalize()).collect();
+        let spread = |s: &TileStore, lvl: u8| {
+            let v: Vec<f64> = probe.iter().map(|p| s.height_m(*p, freq_for_level(lvl))).collect();
+            v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        let before_fine = spread(&s, fine);
+        let before_coarse = s.height_m(c, freq_for_level(e - 2));
+        // Fully damp detail finer than level e around c.
+        s.edits().stroke_damp(e, c, 5_000.0, |_, _| 1.0);
+        let after = s.height_m(c, freq_for_level(fine));
+        let at_e = s.height_m(c, freq_for_level(e));
+        assert!((after - at_e).abs() < 1e-6, "fine {after} vs level-e {at_e}");
+        // A mesh no finer than level e does not change, and far away nothing does.
+        assert!((s.height_m(c, freq_for_level(e - 2)) - before_coarse).abs() < 1e-9);
+        let far = dir(30000);
+        let plain = store();
+        assert!((s.height_m(far, freq_for_level(fine)) - plain.height_m(far, freq_for_level(fine))).abs() < 1e-9);
+        assert!(spread(&s, fine) <= before_fine * 1.1 + 0.01, "{} vs {}", spread(&s, fine), before_fine);
     }
 
     fn store() -> TileStore {

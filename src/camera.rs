@@ -35,6 +35,19 @@ impl Fly {
         (up.cross(east), east, up)
     }
 
+    /// Moves to a new spot, keeping the view steady: the look direction is carried along (the way it would turn if
+    /// you walked a great circle) and the compass heading is worked out again for the new spot. Heading alone
+    /// would whip around near a pole, where "east" changes meaning within a few meters.
+    pub fn move_to(&mut self, new_dir: DVec3) {
+        let (old, new) = (self.dir.normalize(), new_dir.normalize());
+        let look = self.forward();
+        let rot = glam::DQuat::from_rotation_arc(old, new);
+        let look = rot * look;
+        self.dir = new;
+        let (n, e, _) = self.frame();
+        self.heading = look.dot(e).atan2(look.dot(n));
+    }
+
     /// Where the camera looks, as a unit vector in globe coordinates.
     pub fn forward(&self) -> DVec3 {
         let (n, e, up) = self.frame();
@@ -231,5 +244,24 @@ mod tests {
         };
         assert!((depth(0.01) - 1.0).abs() < 1e-12);
         assert!(depth(0.1) < depth(0.05) && depth(1e6) > 0.0 && depth(1e6) < 1e-6);
+    }
+
+    #[test]
+    fn walking_over_the_pole_keeps_the_view_steady() {
+        // Start 1 degree from the north pole looking at the pole, walk straight across it in small steps.
+        let start = DVec3::new((1f64).to_radians().sin(), 0.0, (1f64).to_radians().cos());
+        let mut f = Fly { dir: start, heading: 0.0, tilt: -0.1 };
+        let mut look = f.forward();
+        for _ in 0..400 {
+            let (n, e, _) = f.frame();
+            let (sh, ch) = f.heading.sin_cos();
+            let mv = n * ch + e * sh;
+            f.move_to((f.dir + mv * 0.0001).normalize());
+            let now = f.forward();
+            // A tiny step turns the view by about the step, never by a jump.
+            assert!((now - look).length() < 0.0003, "view jumped: {}", (now - look).length());
+            look = now;
+        }
+        assert!(f.dir.z.abs() < 0.9999 && f.dir.x < 0.0, "crossed to the far side: {:?}", f.dir);
     }
 }

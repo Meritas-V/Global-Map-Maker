@@ -9,6 +9,7 @@
 //! from orbit down to centimeters.
 
 use crate::camera::Camera;
+use crate::planet::{self, BiomeMode, PlanetSettings, BIOME_COUNT, DEFAULT_COVER};
 use glam::DVec3;
 
 pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
@@ -42,6 +43,12 @@ const PLAIN_HILLS_M: f64 = 45.0;
 const HILLS_PERSISTENCE: f64 = 0.5;
 /// Soft rolling hills on the plains: amplitude in meters (a few km wide, fading to nothing at fine scales).
 const PLAIN_ROLL_M: f64 = 450.0;
+/// Mesa terraces: height of one step (m).
+const MESA_STEP: f64 = 75.0;
+/// Dune fields: ridged noise (about +-0.12) times this is a few tens of meters of dune.
+const DUNE_AMP: f64 = 450.0;
+/// Height of the rock domes on the plains (m).
+const DOME_M: f64 = 140.0;
 /// Ridge noise below this is plain, above it (over the span) it rises to peaks.
 const RIDGE_LOW: f64 = 0.30;
 const RIDGE_SPAN: f64 = 0.45;
@@ -76,6 +83,7 @@ fn splitmix(state: &mut u64) -> u64 {
 
 pub struct Terrain {
     perm: [u8; 512],
+    settings: PlanetSettings,
 }
 
 /// Anything that can say how high the ground is in a direction: the terrain function itself or the
@@ -84,10 +92,37 @@ pub trait HeightSource: Sync {
     /// Height above (positive) or below (negative) sea level in meters, with detail up to `max_freq`.
     fn height_m(&self, d: DVec3, max_freq: f64) -> f64;
 
+    /// Changes whenever the ground is edited by hand (0 for a source that cannot be). A mesh made while it changes is
+    /// not a snapshot of any one state.
+    fn edit_version(&self) -> u64 {
+        0
+    }
+
     /// Like `height_m`, but a source that makes its data lazily must not make any here: it answers from
     /// what exists (coarser data stands in). For quick tests that only need roughly the right height.
     fn height_m_peek(&self, d: DVec3, max_freq: f64) -> f64 {
         self.height_m(d, max_freq)
+    }
+
+    /// Ground cover colour (biome) at a direction and height; the plain forest green when the source has none.
+    fn cover(&self, _d: DVec3, _h: f64) -> [f32; 3] {
+        DEFAULT_COVER
+    }
+
+    /// How much the beach is sand rather than stone varies along a coast: a smooth -0.6..0.6 wobble with blobs about
+    /// 1.5 km across, from the direction alone (so it holds still however the view changes). 0 without biomes.
+    fn beach_noise(&self, _d: DVec3) -> f32 {
+        0.0
+    }
+
+    /// Meters added to heights when choosing colours (the planet's sea level; 0 when the source has none).
+    fn alt_shift(&self) -> f64 {
+        0.0
+    }
+
+    /// How sandy the beaches are here (0..1); all sand when the source has no biomes.
+    fn sandy(&self, _d: DVec3, _h: f64) -> f32 {
+        1.0
     }
 
     /// Radius of the visible surface in the direction `d` (a unit vector). The sea is a flat sphere.
@@ -229,10 +264,33 @@ impl HeightSource for Terrain {
     fn height_m(&self, d: DVec3, max_freq: f64) -> f64 {
         self.height_fn(d, max_freq)
     }
+
+    fn cover(&self, d: DVec3, h: f64) -> [f32; 3] {
+        self.cover_at(d, h)
+    }
+
+    fn sandy(&self, d: DVec3, h: f64) -> f32 {
+        planet::blend_sandy(&self.biome_weights(d, h))
+    }
+
+    fn alt_shift(&self) -> f64 {
+        self.settings.sea_level_m
+    }
+
+    fn beach_noise(&self, d: DVec3) -> f32 {
+        const F: f64 = 4000.0; // unit sphere -> ~1.6 km blobs
+        (self.noise(d.x * F + 101.0, d.y * F - 37.0, d.z * F + 11.0) * 0.6).clamp(-0.6, 0.6) as f32
+    }
 }
 
 impl Terrain {
+    /// The default planet with this seed.
     pub fn new(seed: u64) -> Terrain {
+        Terrain::with_settings(&PlanetSettings { seed, ..PlanetSettings::default() })
+    }
+
+    pub fn with_settings(settings: &PlanetSettings) -> Terrain {
+        let seed = settings.seed;
         let mut p: Vec<u8> = (0..=255).collect();
         let mut s = seed;
         for i in (1..256).rev() {
@@ -243,7 +301,7 @@ impl Terrain {
         for i in 0..512 {
             perm[i] = p[i & 255];
         }
-        Terrain { perm }
+        Terrain { perm, settings: settings.clone() }
     }
 
     /// Perlin's improved gradient noise, roughly -1..1.
@@ -322,10 +380,62 @@ impl Terrain {
         sum / norm
     }
 
-    /// The terrain function itself: height in meters, with detail up to `max_freq`.
+    pub fn settings(&self) -> &PlanetSettings {
+        &self.settings
+    }
+
+    /// Continent noise value above which there is land: the "land amount" setting moves it.
+    fn sea(&self) -> f64 {
+        SEA + (0.5 - self.settings.land) * 0.3
+    }
+
+    /// Temperature and moisture (both 0..1) at sea level for a direction: cold toward the poles, wet near the
+    /// equator and in the 60 degree belts, dry in the 30 degree belts and inland. The climate does not change
+    /// with zoom (no detail limit), and does not depend on the ground height (mountains cool it later, in `cover`).
+    pub fn climate(&self, d: DVec3) -> (f64, f64) {
+        const NO_LIMIT: f64 = 1e12;
+        let s = &self.settings;
+        let rot = DVec3::new(d.y, d.z, d.x);
+        let (mut t, mut m) = match s.biomes {
+            BiomeMode::Patchwork => (0.5 + 2.2 * self.fbm(d, 4.0, 0.5, 3, NO_LIMIT, false), 0.5 + 2.2 * self.fbm(rot, 3.0, 0.5, 3, NO_LIMIT, false)),
+            _ => {
+                let lat = d.z.clamp(-1.0, 1.0).asin();
+                let inland = smooth(0.05, 0.35, self.fbm(d, 1.4, 0.5, 4, NO_LIMIT, false) - self.sea());
+                (
+                    lat.cos().powf(1.3) + 0.6 * self.fbm(d, 2.3, 0.5, 3, NO_LIMIT, false),
+                    0.55 + 0.20 * (6.0 * lat).cos() + 0.8 * self.fbm(rot, 2.0, 0.5, 3, NO_LIMIT, false) - 0.15 * inland,
+                )
+            }
+        };
+        t += (s.climate - 0.5) * 0.7;
+        m += (s.wetness - 0.5) * 0.7;
+        (t.clamp(0.0, 1.0), m.clamp(0.0, 1.0))
+    }
+
+    /// Biome memberships at a direction and ground height (m): higher is colder.
+    pub fn biome_weights(&self, d: DVec3, h: f64) -> [f64; BIOME_COUNT] {
+        if let BiomeMode::Single(b) = self.settings.biomes {
+            let mut w = [0.0; BIOME_COUNT];
+            w[b.index()] = 1.0;
+            return w;
+        }
+        let (t, m) = self.climate(d);
+        planet::weights((t - 0.00013 * h.max(0.0)).clamp(0.0, 1.0), m)
+    }
+
+    /// Ground cover colour here (see `planet::Biome::cover`).
+    pub fn cover_at(&self, d: DVec3, h: f64) -> [f32; 3] {
+        planet::blend_cover(&self.biome_weights(d, h))
+    }
+
+    /// The terrain function itself: height in meters above the sea surface, with detail up to `max_freq`.
     pub fn height_fn(&self, d: DVec3, max_freq: f64) -> f64 {
+        self.height_raw(d, max_freq) - self.settings.sea_level_m
+    }
+
+    fn height_raw(&self, d: DVec3, max_freq: f64) -> f64 {
         let c = self.fbm(d, 1.4, 0.5, 8, max_freq, false);
-        let e = c - SEA;
+        let e = c - self.sea();
         if e < 0.0 {
             let s = (-e / DEPTH_SPAN).clamp(0.0, 1.0);
             let mut h = -(250.0 * s + 3800.0 * s * s);
@@ -341,7 +451,9 @@ impl Terrain {
         // Continental base: land rises gently from the coast, with broad swells and plateaus further in. Plains stay
         // low (a few hundred meters) instead of every bit of inland being highland.
         let swell = smooth(0.1, 0.5, self.fbm(d, 3.1, 0.5, 3, max_freq, false));
-        let low = 380.0 * smooth(0.0, 0.5, e) + 700.0 * swell * smooth(0.05, 0.4, e);
+        // A thin beach: the land climbs about 30 m in the first sliver of land, so the sand strip is narrow and the
+        // ground behind it is decisively above it, instead of a wide flat shelf where small bumps decide sand or grass.
+        let low = 380.0 * smooth(0.0, 0.5, e) + 30.0 * smooth(0.0, 0.03, e) + 700.0 * swell * smooth(0.05, 0.4, e);
         let belt = smooth(0.02, 0.34, self.fbm(d, 2.6, 0.5, 4, max_freq, false) + 0.07);
         // Bend the direction a little before the mountain noises read it: ridges curve and wander instead of
         // looking like one uniform grain over the whole planet.
@@ -356,21 +468,44 @@ impl Terrain {
         let ridge = RIDGE_MEAN + self.fbm(dw, 7.0, 0.62, MACRO_RIDGE_OCTAVES, max_freq, true);
         let peaks = ((ridge - RIDGE_LOW) / RIDGE_SPAN).clamp(0.0, 1.0).powf(2.0);
         let mountain = belt * smooth(0.02, 0.22, e) * peaks; // 0 on plains .. 1 on the highest belts
-        let macro_h = low + MACRO_PEAK_M * mountain;
+        let shape = planet::blend_shape(&self.biome_weights(d, 0.0));
+        let macro_h = low + MACRO_PEAK_M * self.settings.mountains * shape.mountains * mountain;
         // Detail follows the terrain TYPE, not the height: crags (sharp ridged detail) only inside the mountain
         // belts, hills mostly there too, and the plains between stay smooth with only gentle rolling.
         let rugged = smooth(0.04, 0.45, mountain);
-        let crags = self.fbm_ex(dw, 7.0 * 16.0, CRAG_PERSISTENCE, 18, max_freq, true, CRAG_KNEE, CRAG_FINE_PERSISTENCE) * CRAG_AMP * rugged;
-        let hills = self.fbm(dw, 30.0, HILLS_PERSISTENCE, 18, max_freq, false) * (PLAIN_HILLS_M + (HILLS_M - PLAIN_HILLS_M) * smooth(0.04, 0.6, mountain));
+        let crags = self.fbm_ex(dw, 7.0 * 16.0, CRAG_PERSISTENCE, 18, max_freq, true, CRAG_KNEE, CRAG_FINE_PERSISTENCE) * CRAG_AMP * rugged * self.settings.mountains;
+        let hills = self.fbm(dw, 30.0, HILLS_PERSISTENCE, 18, max_freq, false) * (PLAIN_HILLS_M + (HILLS_M - PLAIN_HILLS_M) * smooth(0.04, 0.6, mountain)) * shape.hills;
         // Rolling country: soft hills a few km across, strongest on the plains (mountains have their own relief).
-        let rolling = self.fbm(dw, 500.0, 0.5, 14, max_freq, false) * PLAIN_ROLL_M * (1.0 - 0.8 * smooth(0.04, 0.5, mountain));
+        let rolling = self.fbm(dw, 500.0, 0.5, 14, max_freq, false) * PLAIN_ROLL_M * (1.0 - 0.8 * smooth(0.04, 0.5, mountain)) * shape.hills;
         // Near the coast the relief may only add, never dig: otherwise flat land just above sea level gets
         // dips below zero and turns into scattered ponds with sand rims. The dig allowed grows with the land's rise.
         let relief = hills + rolling + crags;
         let relief = if relief < 0.0 { relief * smooth(0.04, 0.4, e) } else { relief };
         // Gentle shore: land right at the coast sits a little above the water and rises smoothly.
         let shore = 1.5 + 10.0 * smooth(0.0, 0.08, e);
-        soft_peak((macro_h + relief * r).max(shore))
+        let mut ground = macro_h + relief * r * r;
+        // Desert shapes: flat-topped mesas (the ground is cut into terraces with steep risers where a patchy
+        // noise says so), and dune fields on low dry ground.
+        if shape.mesas > 0.001 {
+            let patches = smooth(0.05, 0.18, self.fbm(d, 40.0, 0.5, 2, max_freq, false));
+            let gate = shape.mesas * patches * (1.0 - smooth(0.1, 0.5, mountain)) * smooth(120.0, 300.0, ground);
+            if gate > 0.001 {
+                let q = ground / MESA_STEP;
+                let terraced = MESA_STEP * (q.floor() + smooth(0.7, 1.0, q - q.floor()));
+                ground += (terraced - ground) * gate;
+            }
+        }
+        let dune_gate = shape.dunes * (1.0 - smooth(0.0, 0.3, mountain)) * smooth(0.02, 0.15, e) * (1.0 - smooth(900.0, 1400.0, low));
+        let dunes = if dune_gate > 0.001 { self.fbm(dw, 3500.0, 0.5, 3, max_freq, true) * DUNE_AMP * dune_gate } else { 0.0 };
+        // Plains: now and then a bare rock dome rises out of the flat country (an inselberg).
+        let domes = if shape.domes > 0.001 {
+            let w = Self::octave_weight(700.0, max_freq);
+            let n = 0.5 + 0.5 * self.noise(d.x * 700.0 + 11.0, d.y * 700.0 - 7.0, d.z * 700.0 + 3.0);
+            shape.domes * w * smooth(0.78, 0.93, n) * DOME_M * (1.0 - smooth(0.1, 0.3, mountain)) * smooth(0.05, 0.2, e)
+        } else {
+            0.0
+        };
+        soft_peak((ground + dunes + domes).max(shore))
     }
 }
 
@@ -402,6 +537,17 @@ fn ramp(stops: &[(f64, [f32; 3])], x: f64) -> [f32; 3] {
 /// Surface color from height (m) and steepness (0 flat .. 1 vertical): water shades darker with
 /// depth, land goes sand, grass, forest, rock, snow, and steep slopes show bare rock.
 pub fn color(h: f64, steepness: f64) -> [f32; 3] {
+    color_c(h, steepness, DEFAULT_COVER)
+}
+
+/// `color` with a biome's ground cover colour in place of the forest green (the height ramp darkens it toward the
+/// forest line the same way; `DEFAULT_COVER` gives back the plain `color`).
+pub fn color_c(h: f64, steepness: f64, cover: [f32; 3]) -> [f32; 3] {
+    color_cs(h, steepness, cover, 1.0)
+}
+
+/// `color_c` with `sandy` beaches (see `planet::beach`; 1 = the plain sand).
+pub fn color_cs(h: f64, steepness: f64, cover: [f32; 3], sandy: f32) -> [f32; 3] {
     if h < 0.0 {
         return ramp(
             &[
@@ -415,14 +561,22 @@ pub fn color(h: f64, steepness: f64) -> [f32; 3] {
             -h,
         );
     }
+    // The ramp stops darken or brighten the biome's colour as a whole (same hue): scaling each channel on its own
+    // blew the blue channel up for cold biomes and turned them lilac.
+    let lum = |a: [f32; 3]| 0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2];
+    let k = |a: [f32; 3]| {
+        let s = lum(a) / lum(DEFAULT_COVER);
+        cover.map(|c| c * s)
+    };
+    let beach = planet::beach(cover, sandy);
     let base = ramp(
         &[
-            (0.0, [0.62, 0.50, 0.26]),
-            (7.0, [0.58, 0.47, 0.24]),
-            (13.0, [0.22, 0.42, 0.08]),
-            (500.0, [0.15, 0.34, 0.06]),
-            (1_200.0, [0.07, 0.22, 0.06]),
-            (2_000.0, [0.18, 0.27, 0.09]),
+            (0.0, beach),
+            (7.0, beach.map(|x| x * 0.94)),
+            (13.0, cover),
+            (500.0, k([0.15, 0.34, 0.06])),
+            (1_200.0, k([0.07, 0.22, 0.06])),
+            (2_000.0, k([0.18, 0.27, 0.09])),
             (2_600.0, [0.33, 0.30, 0.25]),
             (3_200.0, [0.42, 0.38, 0.33]),
         ],
@@ -445,13 +599,29 @@ pub const RANGE_FREQ: f64 = 54.33; // lands exactly on tile level 2: one tile lo
 /// coarse (RANGE_FREQ) terrain at the same spot: it tints whole ranges grey at any zoom, so a range seen
 /// from far away looks the same as when you get close (fine detail only adds slopes and crags on top).
 pub fn color_in_range(h: f64, range_h: f64, steepness: f64) -> [f32; 3] {
-    let base = color(h, steepness);
+    color_in_range_c(h, range_h, steepness, DEFAULT_COVER)
+}
+
+/// The hint over whole mountain ranges: a cool stone grey (a warm one turned salmon pink under the warm sun).
+pub const RANGE_GREY: [f32; 3] = [0.33, 0.33, 0.31];
+pub const RANGE_TINT: f64 = 0.6;
+
+pub fn color_in_range_c(h: f64, range_h: f64, steepness: f64, cover: [f32; 3]) -> [f32; 3] {
+    color_in_range_s(h, range_h, steepness, cover, 1.0, 0.0)
+}
+
+/// With `shift` meters added to the heights the colours are judged by (the planet's sea level: the land was
+/// lowered or raised by it, but lowland should stay lowland and only real mountains go rocky and snowy). Whether
+/// it is water is still decided by the true height.
+pub fn color_in_range_s(h: f64, range_h: f64, steepness: f64, cover: [f32; 3], sandy: f32, shift: f64) -> [f32; 3] {
     if h < 0.0 {
-        return base;
+        return color_c(h, steepness, cover);
     }
-    let grey = [0.36f32, 0.32, 0.28];
+    let (h, range_h) = ((h + shift).max(0.0), (range_h + shift).max(0.0));
+    let base = color_cs(h, steepness, cover, sandy);
+    let grey = RANGE_GREY;
     let snowy = smooth(3_600.0, 4_700.0, h) as f32;
-    let m = (smooth(1_300.0, 3_000.0, range_h) * 0.7) as f32 * (1.0 - snowy);
+    let m = (smooth(1_300.0, 3_000.0, range_h) * RANGE_TINT) as f32 * (1.0 - snowy);
     [0, 1, 2].map(|i| base[i] + (grey[i] - base[i]) * m)
 }
 
@@ -682,5 +852,15 @@ mod tests {
         let focal = 869.0;
         assert!(max_freq(3.0, focal) < max_freq(0.01, focal));
         assert_eq!(max_freq(1e-12, focal), MAX_FREQ_CAP);
+    }
+
+    #[test]
+    fn lowered_land_keeps_lowland_colours() {
+        // Sea level -2000: land that is 2000 m up in the mesh is really lowland (grass), not snow-line rock.
+        let plain = color_in_range_c(100.0, 200.0, 0.0, DEFAULT_COVER);
+        let shifted = color_in_range_s(2_100.0, 2_200.0, 0.0, DEFAULT_COVER, 1.0, -2_000.0);
+        assert_eq!(plain, shifted);
+        // Water is still decided by the true height.
+        assert_eq!(color_in_range_s(-5.0, 0.0, 0.0, DEFAULT_COVER, 1.0, 500.0), color_c(-5.0, 0.0, DEFAULT_COVER));
     }
 }

@@ -19,7 +19,7 @@ fn render(cam: &Camera, tiles: &TileStore, w: usize, h: usize) -> Vec<u8> {
     let origin = cam.eye64().normalize() * cam.floor;
     let light = cam.light_dir();
     let light = DVec3::new(light.x as f64, light.y as f64, light.z as f64).normalize();
-    let lighting = Lighting::new(light, origin, cam.eye64(), haze);
+    let lighting = Lighting::new(light, origin, cam.eye64(), haze).with_alt_shift(tiles.terrain().settings().sea_level_m);
     // Twice: the first pass makes the tiles, the second walks with exact heights.
     let _ = build_ground(&patches, origin, &view);
     let view = PixelView::from_camera(cam, w as u32, h as u32, Some(tref(cam)));
@@ -61,7 +61,8 @@ fn render(cam: &Camera, tiles: &TileStore, w: usize, h: usize) -> Vec<u8> {
                     let mix = |f: &dyn Fn(&GroundVertex) -> f32| w0 * f(&s[0].3) + w1 * f(&s[1].3) + w2 * f(&s[2].3);
                     let rel = DVec3::new(mix(&|v| v.pos[0]) as f64, mix(&|v| v.pos[1]) as f64, mix(&|v| v.pos[2]) as f64);
                     let nrm = [mix(&|v| v.normal()[0]), mix(&|v| v.normal()[1]), mix(&|v| v.normal()[2])];
-                    color[i] = shade(mix(&|v| v.hr[0]) as f64, mix(&|v| v.hr[1]) as f64, nrm, mix(&|v| v.steepness()), rel, &lighting);
+                    let cover = [0, 1, 2].map(|k| mix(&|v| v.cover[k] as f32 / 255.0));
+                    color[i] = global_map_maker::ground::shade_cover(mix(&|v| v.hr[0]) as f64, mix(&|v| v.hr[1]) as f64, nrm, mix(&|v| v.steepness()), rel, &lighting, cover, mix(&|v| v.cover[3] as f32 / 255.0));
                 }
             }
         }
@@ -138,5 +139,48 @@ fn preview() {
             std::fs::write(format!("/tmp/preview_{tag}_{idx}_{target}_{name}.ppm"), img).unwrap();
             idx += 1;
         }
+    }
+}
+
+/// The biomes: the globe of the default planet from three sides, and an inside view over low ground of a planet
+/// that is one biome. Run: cargo test --release --test preview biomes_preview -- --ignored --nocapture
+#[test]
+#[ignore]
+fn biomes_preview() {
+    use global_map_maker::planet::{Biome, BiomeMode, PlanetSettings};
+    let (w, h) = (640usize, 360usize);
+    let tiles = TileStore::new(Terrain::with_settings(&PlanetSettings::default()));
+    for (i, yaw) in [0.0f64, 2.1, 4.2].iter().enumerate() {
+        let cam = Camera { yaw: *yaw, pitch: 0.25, distance: 3.2, floor: 1.0, fly: None };
+        std::fs::write(format!("/tmp/bio_globe_{i}.ppm"), render(&cam, &tiles, w, h)).unwrap();
+    }
+    for b in Biome::ALL {
+        let s = PlanetSettings { biomes: BiomeMode::Single(b), ..PlanetSettings::default() };
+        let tiles = TileStore::new(Terrain::with_settings(&s));
+        let site = find_site(tiles.terrain(), 150.0, 20);
+        let (n, _e, _) = Fly { dir: site, heading: 0.0, tilt: 0.0 }.frame();
+        for (name, km, alt_m, tilt) in [("far", 25.0, 900.0, -0.12), ("near", 3.0, 150.0, -0.05)] {
+            let dir = (site - n * (km * 1000.0 / 6_371_000.0)).normalize();
+            let alt = alt_m / 6_371_000.0;
+            let f = max_freq(alt, Camera::focal_px(h as f64));
+            let mut cam = Camera { yaw: 0.0, pitch: 0.0, distance: 1.0, floor: 1.0, fly: Some(Fly { dir, heading: 0.0, tilt }) };
+            cam.floor = tiles.ground_radius(dir, f);
+            cam.distance = cam.floor + alt;
+            std::fs::write(format!("/tmp/bio_{}_{name}.ppm", b.name()), render(&cam, &tiles, w, h)).unwrap();
+        }
+    }
+}
+
+/// The globe with the settings in PREVIEW_SEED / PREVIEW_SEA. Run: cargo test --release --test preview settings_globe -- --ignored
+#[test]
+#[ignore]
+fn settings_globe() {
+    use global_map_maker::planet::PlanetSettings;
+    let seed = std::env::var("PREVIEW_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
+    let sea = std::env::var("PREVIEW_SEA").ok().and_then(|s| s.parse().ok()).unwrap_or(-2000.0);
+    let tiles = TileStore::new(Terrain::with_settings(&PlanetSettings { seed, sea_level_m: sea, ..PlanetSettings::default() }));
+    for (i, (yaw, d, pitch)) in [(0.0f64, 3.2f64, 0.25f64), (2.1, 3.2, 0.25), (0.0, 1.5, 1.25)].iter().enumerate() {
+        let cam = Camera { yaw: *yaw, pitch: *pitch, distance: *d, floor: 1.0, fly: None };
+        std::fs::write(format!("/tmp/sg_{i}.ppm"), render(&cam, &tiles, 640, 360)).unwrap();
     }
 }
